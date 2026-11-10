@@ -41,16 +41,24 @@ public final class SeedWriter {
     public static Map<String, String> write(SeededBook book, String instrumentsSha256, Path dir) {
         String accounts = accountsCsv(book), positions = positionsCsv(book);
         var cfg = book.config();
+        var t = cfg.targets();
         StringBuilder meta = new StringBuilder()
-                .append("generator_version=1\n")
+                .append("generator_version=2\n")
                 .append("seed=").append(cfg.seed()).append('\n')
                 .append("accounts=").append(cfg.accounts()).append('\n')
                 .append("as_of=").append(cfg.asOf()).append('\n')
-                .append("proxy_margin_rate=").append(cfg.proxyMarginRate().toPlainString()).append('\n')
+                .append("valuation=").append(cfg.asOf()).append("T15:30:00+05:30\n")
+                .append("start_vix=").append(cfg.vix().toPlainString()).append('\n')
+                .append("start_spot=").append(book.startSpots()).append('\n')
                 .append("thin_funded_bp=").append(cfg.thinFundedBp()).append('\n')
+                .append("target_utilisation_bp=thin:").append(t.thinLoBp()).append("-").append(t.thinHiBp())
+                .append(",funded:").append(t.fundedLoBp()).append("-").append(t.fundedHiBp())
+                .append(",spread:").append(t.spreadLoBp()).append("-").append(t.spreadHiBp()).append('\n')
                 .append("archetype_weights=").append(cfg.archetypeWeights()).append('\n')
                 .append("underlying_weights=").append(cfg.underlyingWeights()).append('\n')
                 .append("underlyings_used=").append(String.join(",", book.underlyings())).append('\n')
+                // Cash balances are sized with the margin engine: a different config gives a different book.
+                .append("margin_config_sha256=").append(cfg.margin().fingerprint()).append('\n')
                 .append("instruments_sha256=").append(instrumentsSha256).append('\n')
                 .append("accounts_sha256=").append(sha256(accounts)).append('\n')
                 .append("positions_sha256=").append(sha256(positions)).append('\n');

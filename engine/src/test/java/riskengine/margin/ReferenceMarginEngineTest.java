@@ -15,8 +15,6 @@ import riskengine.events.EventLog;
 import riskengine.events.FileEventLog;
 import riskengine.events.InMemoryEventLog;
 import riskengine.events.Tick;
-import riskengine.margin.ReferenceMarginEngine.AccountBook;
-import riskengine.margin.ReferenceMarginEngine.MarginEvent;
 import riskengine.ref.Instrument;
 import riskengine.ref.InstrumentType;
 
@@ -27,8 +25,11 @@ class ReferenceMarginEngineTest {
             25, BigDecimal.ONE, BigDecimal.ONE, 1);
     static final List<Instrument> INSTRUMENTS = List.of(CE, PE, FAR_PUT);
 
+    /** Positions opened at a price of 1: fine for options (premium is already in cash), not used for futures here. */
     static AccountBook book(String id, String cash, Map<String, Long> pos) {
-        return new AccountBook(id, new BigDecimal(cash), BigDecimal.ZERO, new TreeMap<>(pos));
+        TreeMap<String, Position> positions = new TreeMap<>();
+        pos.forEach((k, v) -> positions.put(k, new Position(v, BigDecimal.ONE)));
+        return new AccountBook(id, new BigDecimal(cash), BigDecimal.ZERO, positions);
     }
 
     static final List<AccountBook> BOOKS = List.of(

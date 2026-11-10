@@ -48,17 +48,20 @@ done
 echo "== seeded book reproducibility"
 ./gradlew -q :replayer:test --tests 'riskengine.replayer.seed.SeedGeneratorTest'
 pass "same seed -> byte-identical accounts.csv / positions.csv / book.meta"
-if [ -f data/processed/instruments-2024-06-03.csv ]; then
+# The seed sizes cash with the margin engine, so it needs the 3 June VIX close as well as the instruments.
+if [ -f data/processed/instruments-2024-06-03.csv ] && [ -f data/processed/INDIAVIX.csv ]; then
+  vix=$(grep '^2024-06-03' data/processed/INDIAVIX.csv | tail -1 | cut -d, -f5)
+  [ -n "$vix" ] || fail "data/processed/INDIAVIX.csv has no row for 2024-06-03"
   ./gradlew -q :replayer:installDist
   R=replayer/build/install/replayer/bin/replayer
   tmp=$(mktemp -d)
-  $R seed --instruments data/processed/instruments-2024-06-03.csv --out "$tmp/a" >/dev/null
-  $R seed --instruments data/processed/instruments-2024-06-03.csv --out "$tmp/b" >/dev/null
+  $R seed --instruments data/processed/instruments-2024-06-03.csv --vix "$vix" --out "$tmp/a" >/dev/null
+  $R seed --instruments data/processed/instruments-2024-06-03.csv --vix "$vix" --out "$tmp/b" >/dev/null
   diff -r "$tmp/a" "$tmp/b" >/dev/null || fail "real-data seed runs differ"
-  pass "real 3 June 2024 instruments: two runs byte-identical"
+  pass "real 3 June 2024 instruments (VIX $vix): two runs byte-identical"
   rm -rf "$tmp"
 else
-  echo "  --  skipped real-data check (data/processed/instruments-2024-06-03.csv not built yet; see data/README.md)"
+  echo "  --  skipped real-data check (needs data/processed/instruments-2024-06-03.csv and INDIAVIX.csv; see data/README.md)"
 fi
 
 echo "M1 gate passed."

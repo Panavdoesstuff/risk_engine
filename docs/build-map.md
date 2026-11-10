@@ -92,18 +92,20 @@ Start `docs/decisions.md` on day one. Write one short entry every time you choos
 
 ### M3 — Single ordered log and incremental recompute
 
-- [ ] Event types with deterministic serialisation (fixed field order, no hash-map iteration): `Tick`, `OrderRequest`, `Fill`, `SquareOffResult`
-- [ ] Replayer writes each tick to **every** partition with a global `tick_seq`; it is the only tick writer
-- [ ] `ShardRunner`: one thread reads one partition, applies events strictly in order
-- [ ] Shard-local pricing on each tick (no shared pricer)
-- [ ] `holders` reverse index and `byUnderlying` map
-- [ ] Delta update: `accountVector += qty × (newArray − oldArray)`
-- [ ] Full recompute every K ticks, assert drift within tolerance
-- [ ] Banned in shard code: `System.currentTimeMillis()`, `Random`, iterating unordered sets; use event timestamps and sorted collections
-- [ ] `stateHash()` over sorted shard state
-- [ ] JMH benchmark: naive vs incremental, per tick
+> Built on the `EventLog` interface (in-memory and file); Redpanda arrives in M4. Also done here, as follow-ups approved after M2: seed cash sized by the real margin engine, required margin clamped at zero, and futures P&L counted in available margin (decisions.md #30–#32).
 
-**Gate:** incremental equals full on 10k random portfolios; running the same log twice gives identical hashes per shard; speed-up number recorded in `docs/results.md`.
+- [x] Event types with deterministic serialisation (fixed field order, no hash-map iteration): `Tick`, `OrderRequest`, `Fill`, `SquareOffResult` *(orders and square-off results are accepted and ignored until M4 / M5)*
+- [x] Replayer writes each tick to **every** partition with a global `tick_seq`; it is the only tick writer
+- [x] `ShardRunner`: one thread reads one partition, applies events strictly in order
+- [x] Shard-local pricing on each tick (no shared pricer)
+- [x] `holders` reverse index and `byUnderlying` map
+- [x] Delta update: `accountVector += qty × (newArray − oldArray)`
+- [x] Full recompute every K ticks, assert drift within tolerance *(K = 100, tolerance one paisa)*
+- [x] Banned in shard code: `System.currentTimeMillis()`, `Random`, iterating unordered sets; use event timestamps and sorted collections *(enforced by `DeterminismRulesTest`)*
+- [x] `stateHash()` over sorted shard state
+- [x] JMH benchmark: naive vs incremental, per tick
+
+**Gate:** incremental equals full on 10k random portfolios; running the same log twice gives identical hashes per shard; speed-up number recorded in `docs/results.md`. **Passed.**
 
 ### M4 — Shards, orders and security
 

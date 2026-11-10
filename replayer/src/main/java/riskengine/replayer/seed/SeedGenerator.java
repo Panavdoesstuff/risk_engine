@@ -9,17 +9,30 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.math.MathContext;
+import riskengine.margin.AccountVector;
+import riskengine.margin.MarginCalculator;
+import riskengine.margin.MarginResult;
+import riskengine.margin.MarketState;
+import riskengine.margin.RiskArray;
+import riskengine.margin.ScenarioGrid;
+import riskengine.margin.UnderlyingParams;
+import riskengine.pricing.TimeToExpiry;
 import riskengine.ref.Instrument;
 import riskengine.ref.InstrumentType;
 
 /**
  * Builds a believable start-of-day book from the previous day's instruments. Every position opens at
- * that day's settlement price, so the replay day starts flat (zero MTM) and every rupee of P&L comes
- * from the crash.
+ * that day's settlement price, so the replay day starts (almost) flat and the P&L comes from the crash.
+ *
+ * <p><b>Funding.</b> Each account's cash is sized with the real margin engine: the generator computes the
+ * account's required margin at the previous close and sets cash so that utilisation lands in a target
+ * band for its kind (see {@link SeedConfig.FundingTargets}). The margin config's fingerprint is written
+ * to book.meta, because a different config means different cash balances.
  *
  * <p>Determinism rules: all iteration is over sorted collections; each account draws from its own
- * {@link SplitMix64} stream; money is BigDecimal and random factors are integer basis points (no
- * double-to-decimal conversion anywhere).
+ * {@link SplitMix64} stream; random factors are integer basis points; cash is rounded down to the paisa
+ * with a fixed rule.
  */
 public final class SeedGenerator {
     /** A chain needs at least this many strikes (with open interest on both sides) to be used. */
@@ -59,6 +72,21 @@ public final class SeedGenerator {
                     + " (need futures and an option chain with >= " + MIN_STRIKES + " strikes expiring after " + cfg.asOf() + ")");
         }
 
+        // Start-of-day market per underlying, as of 15:30 IST on the as-of date.
+        long valuation = TimeToExpiry.expiryMillis(cfg.asOf());
+        SortedMap<String, BigDecimal> startSpots = new TreeMap<>();
+        SortedMap<String, MarketState> markets = new TreeMap<>();
+        SortedMap<String, ScenarioGrid> grids = new TreeMap<>();
+        for (String u : weights.keySet()) {
+            UnderlyingParams p = cfg.margin().params(u);
+            BigDecimal spot = cfg.spotOverrides().get(u);
+            if (spot == null) spot = impliedSpot(universes.get(u).futures().get(0), valuation, cfg.margin().riskFreeRate(), p.dividendYield());
+            startSpots.put(u, spot);
+            markets.put(u, new MarketState(u, spot.doubleValue(), cfg.vix().doubleValue() * p.volScale(), valuation));
+            grids.put(u, new ScenarioGrid(p));
+        }
+        SortedMap<String, RiskArray> arrays = new TreeMap<>(); // each instrument priced once
+
         List<SeededBook.Account> accounts = new ArrayList<>(cfg.accounts());
         List<SeededBook.Position> positions = new ArrayList<>();
         for (int n = 1; n <= cfg.accounts(); n++) {
@@ -69,29 +97,40 @@ public final class SeedGenerator {
 
             // Legs keyed canonically so the output order never depends on draw order.
             TreeMap<Instrument, Integer> legs = new TreeMap<>(Instrument.CANONICAL);
-            BigDecimal proxyMargin = build(archetype, u, rng, legs, cfg);
+            build(archetype, u, rng, legs);
             legs.values().removeIf(l -> l == 0);
 
-            BigDecimal netPremiumReceived = BigDecimal.ZERO;
+            BigDecimal premiumPaid = BigDecimal.ZERO;
             boolean hasShort = false;
+            AccountVector vector = new AccountVector(u.underlying());
+            MarketState market = markets.get(u.underlying());
             for (var e : legs.entrySet()) {
+                Instrument i = e.getKey();
                 if (e.getValue() < 0) hasShort = true;
-                if (e.getKey().type().isOption()) {
-                    netPremiumReceived = netPremiumReceived.subtract(value(e.getKey(), e.getValue()));
-                }
+                if (i.type().isOption()) premiumPaid = premiumPaid.add(value(i, e.getValue()));
+                RiskArray array = arrays.computeIfAbsent(i.id(), id -> RiskArray.compute(i, market, grids.get(i.underlying()), cfg.margin().riskFreeRate()));
+                vector.add((long) e.getValue() * i.lotSize(), i.settle().doubleValue(), array);
             }
+            MarginResult margin = MarginCalculator.compute(vector, cfg.margin(), 0, 0);
 
             boolean nakedShort = archetype.sellsNakedRisk() || (archetype == Archetype.FUTURES_ONLY && hasShort);
             boolean thin = nakedShort && rng.chance(cfg.thinFundedBp());
+            SeedConfig.FundingTargets t = cfg.targets();
             BigDecimal cash;
             if (archetype == Archetype.OPTION_BUYER) {
-                // Premium already paid; left with 10-100% of it as free cash.
-                cash = netPremiumReceived.negate().multiply(bp(rng.nextInt(1_000, 10_000)));
+                // Premium already paid; left with 10-100% of it as free cash. A buyer needs no margin.
+                cash = premiumPaid.multiply(bp(rng.nextInt(1_000, 10_000)));
             } else {
-                int factorBp = thin ? rng.nextInt(10_200, 11_500) : rng.nextInt(14_000, 30_000);
-                cash = netPremiumReceived.add(proxyMargin.multiply(bp(factorBp))).max(BigDecimal.ZERO);
+                int targetBp = thin ? rng.nextInt(t.thinLoBp(), t.thinHiBp())
+                        : archetype == Archetype.HEDGED_SPREAD ? rng.nextInt(t.spreadLoBp(), t.spreadHiBp())
+                        : rng.nextInt(t.fundedLoBp(), t.fundedHiBp());
+                // utilisation = required / (cash + futures MTM)  =>  cash = required / target - futures MTM.
+                // new BigDecimal(double) is the exact binary value: no Double.toString involved.
+                cash = new BigDecimal(margin.required()).multiply(BP).divide(BigDecimal.valueOf(targetBp), MathContext.DECIMAL128)
+                        .subtract(new BigDecimal(margin.futuresMtm())).max(BigDecimal.ZERO);
             }
-            accounts.add(new SeededBook.Account(accountId, archetype, thin, cash.setScale(2, RoundingMode.HALF_UP)));
+            // Round DOWN: a paisa less cash can only push utilisation up, never below the band's floor.
+            accounts.add(new SeededBook.Account(accountId, archetype, thin, cash.setScale(2, RoundingMode.DOWN)));
             for (var e : legs.entrySet()) {
                 Instrument i = e.getKey();
                 int lots = e.getValue();
@@ -99,24 +138,29 @@ public final class SeedGenerator {
                         i.settle().setScale(2, RoundingMode.HALF_UP)));
             }
         }
-        return new SeededBook(cfg, List.copyOf(weights.keySet()), List.copyOf(accounts), List.copyOf(positions));
+        return new SeededBook(cfg, List.copyOf(weights.keySet()), startSpots, List.copyOf(accounts), List.copyOf(positions));
     }
 
-    /** Fills {@code legs} and returns the proxy margin (collateral basis) for the account. */
-    private static BigDecimal build(Archetype a, Universe u, SplitMix64 rng, Map<Instrument, Integer> legs, SeedConfig cfg) {
-        BigDecimal rate = cfg.proxyMarginRate();
+    /**
+     * Spot implied by the near-month futures settle: S = F x e^(-(r-q)T), rounded to the paisa. Under the
+     * engine's cost-of-carry pricing, that future then starts exactly at its settle price (zero MTM).
+     */
+    static BigDecimal impliedSpot(Instrument nearFuture, long valuationMillis, double r, double q) {
+        double t = Math.max(0, TimeToExpiry.years(nearFuture.expiry(), valuationMillis));
+        return new BigDecimal(nearFuture.settle().doubleValue() * StrictMath.exp(-(r - q) * t)).setScale(2, RoundingMode.HALF_UP);
+    }
+
+    /** Fills {@code legs} (instrument to signed lots) for one account. */
+    private static void build(Archetype a, Universe u, SplitMix64 rng, Map<Instrument, Integer> legs) {
         switch (a) {
             case FUTURES_ONLY -> {
                 int nLegs = rng.nextInt(1, Math.min(2, u.futures().size()));
                 int first = (u.futures().size() > 1 && !rng.chance(7_000)) ? 1 : 0;
-                BigDecimal notional = BigDecimal.ZERO;
                 for (int k = 0; k < nLegs; k++) {
                     Instrument f = u.futures().get(k == 0 ? first : 1 - first);
                     int lots = rng.nextInt(1, 10) * (rng.chance(5_000) ? 1 : -1);
                     legs.merge(f, lots, Integer::sum);
-                    notional = notional.add(value(f, Math.abs(lots)));
                 }
-                return notional.multiply(rate);
             }
             case OPTION_BUYER -> {
                 Chain c = pickChain(rng, u);
@@ -129,7 +173,6 @@ public final class SeedGenerator {
                                         : c.put(c.clamp(c.atm() - off, 0, c.last()));
                     legs.merge(i, lots, Integer::sum);
                 }
-                return BigDecimal.ZERO;
             }
             case SHORT_STRADDLE -> {
                 Chain c = pickChain(rng, u);
@@ -137,7 +180,6 @@ public final class SeedGenerator {
                 int lots = rng.nextInt(1, 10);
                 legs.merge(c.call(k), -lots, Integer::sum);
                 legs.merge(c.put(k), -lots, Integer::sum);
-                return nakedProxy(u, c.call(k), lots, rate);
             }
             case SHORT_STRANGLE -> {
                 Chain c = pickChain(rng, u);
@@ -146,40 +188,26 @@ public final class SeedGenerator {
                 int lots = rng.nextInt(1, 10);
                 legs.merge(c.call(kc), -lots, Integer::sum);
                 legs.merge(c.put(kp), -lots, Integer::sum);
-                return nakedProxy(u, c.call(kc), lots, rate);
             }
             case HEDGED_SPREAD -> {
                 Chain c = pickChain(rng, u);
                 int variant = rng.nextInt(0, 2); // 0 bull put, 1 bear call, 2 iron condor
                 int away = rng.nextInt(0, 4), width = rng.nextInt(1, 4), lots = rng.nextInt(1, 10);
-                BigDecimal maxWidth = BigDecimal.ZERO;
                 if (variant == 0 || variant == 2) {
                     int s = c.clamp(c.atm() - away, 1, c.last());
                     int l = Math.max(0, s - width);
                     legs.merge(c.put(s), -lots, Integer::sum);
                     legs.merge(c.put(l), lots, Integer::sum);
-                    maxWidth = maxWidth.max(c.strikes().get(s).subtract(c.strikes().get(l)));
                 }
                 if (variant == 1 || variant == 2) {
                     int s = c.clamp(c.atm() + away, 0, c.last() - 1);
                     int l = Math.min(c.last(), s + width);
                     legs.merge(c.call(s), -lots, Integer::sum);
                     legs.merge(c.call(l), lots, Integer::sum);
-                    maxWidth = maxWidth.max(c.strikes().get(l).subtract(c.strikes().get(s)));
                 }
-                // Max loss = widest wing * qty - net credit (only one side of a condor can lose at expiry).
-                BigDecimal credit = BigDecimal.ZERO;
-                for (var e : legs.entrySet()) credit = credit.subtract(value(e.getKey(), e.getValue()));
-                long qty = (long) lots * c.call(0).lotSize();
-                return maxWidth.multiply(BigDecimal.valueOf(qty)).subtract(credit).max(BigDecimal.ZERO);
             }
             default -> throw new IllegalStateException(a.toString());
         }
-    }
-
-    /** Straddle/strangle risk is roughly one side's naked exposure: rate * ref * qty. */
-    private static BigDecimal nakedProxy(Universe u, Instrument leg, int lots, BigDecimal rate) {
-        return u.ref().multiply(BigDecimal.valueOf((long) lots * leg.lotSize())).multiply(rate);
     }
 
     private static BigDecimal value(Instrument i, int lots) {

@@ -27,6 +27,15 @@ public final class MarginStatusTracker {
         return level;
     }
 
+    /** Consecutive readings at or above the margin-call threshold. Part of the shard's hashed state. */
+    public int callStreak() {
+        return callStreak;
+    }
+
+    public int squareOffStreak() {
+        return squareOffStreak;
+    }
+
     /** @return the level after this reading */
     public MarginLevel onReading(double utilisation) {
         callStreak = utilisation >= t.marginCall() ? callStreak + 1 : 0;

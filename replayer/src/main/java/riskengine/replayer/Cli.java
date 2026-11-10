@@ -34,9 +34,16 @@ public final class Cli {
               bars         --in FILE --out FILE [--from YYYY-MM-DD] [--to YYYY-MM-DD]
                   Normalise index minute bars or India VIX (minute or daily) to ts,open,high,low,close.
 
-              seed         --instruments FILE --out DIR [--seed 42] [--accounts 1000]
-                           [--as-of 2024-06-03] [--thin-bp 2500]
-                  Generate the start-of-day book (accounts.csv, positions.csv, book.meta).
+              seed         --instruments FILE --vix LEVEL --out DIR [--seed 42] [--accounts 1000]
+                           [--as-of 2024-06-03] [--thin-bp 2500] [--spot LEVEL]
+                  Generate the start-of-day book (accounts.csv, positions.csv, book.meta). Cash is sized
+                  with the margin engine at the as-of close, so it needs that day's India VIX close.
+                  --spot defaults to the level implied by the near-month futures settle.
+
+              ticks        --bars FILE --vix FILE --out DIR [--partitions 4] [--underlying NIFTY]
+                           [--from YYYY-MM-DD] [--to YYYY-MM-DD]
+                  Turn normalised bars (output of `bars`) into Tick events and write every tick to
+                  every partition log (partition-0.log ...). This is the only tick writer.
             """;
 
     private Cli() {}
@@ -52,6 +59,7 @@ public final class Cli {
                 case "instruments" -> instruments(f);
                 case "bars" -> bars(f);
                 case "seed" -> seed(f);
+                case "ticks" -> ticks(f);
                 default -> throw new IllegalArgumentException("unknown command " + args[0]);
             }
         } catch (IllegalArgumentException e) {
@@ -82,13 +90,13 @@ public final class Cli {
     private static void seed(Map<String, String> f) throws IOException {
         Path instrumentsFile = Path.of(req(f, "instruments"));
         List<Instrument> instruments = InstrumentCsv.read(instrumentsFile);
-        SeedConfig d = SeedConfig.defaults(
+        SeedConfig cfg = SeedConfig.defaults(
                 Long.parseLong(f.getOrDefault("seed", "42")),
                 Integer.parseInt(f.getOrDefault("accounts", "1000")),
-                LocalDate.parse(f.getOrDefault("as-of", "2024-06-03")));
-        SeedConfig cfg = new SeedConfig(d.seed(), d.accounts(), d.asOf(), d.proxyMarginRate(),
-                Integer.parseInt(f.getOrDefault("thin-bp", String.valueOf(d.thinFundedBp()))),
-                d.archetypeWeights(), d.underlyingWeights());
+                LocalDate.parse(f.getOrDefault("as-of", "2024-06-03")),
+                new java.math.BigDecimal(req(f, "vix")));
+        if (f.containsKey("thin-bp")) cfg = cfg.withThinFundedBp(Integer.parseInt(f.get("thin-bp")));
+        if (f.containsKey("spot")) cfg = cfg.withSpot("NIFTY", new java.math.BigDecimal(f.get("spot")));
         SeededBook book = SeedGenerator.generate(instruments, cfg);
         var written = SeedWriter.write(book, SeedWriter.sha256(Files.readAllBytes(instrumentsFile)), Path.of(req(f, "out")));
 
@@ -96,8 +104,21 @@ public final class Cli {
         book.accounts().forEach(a -> mix.merge(a.archetype(), 1, Integer::sum));
         long thin = book.accounts().stream().filter(SeededBook.Account::thinFunded).count();
         System.out.println(book.accounts().size() + " accounts, " + book.positions().size() + " positions, "
-                + thin + " thin-funded; mix " + mix + "; underlyings " + book.underlyings());
+                + thin + " thin-funded; mix " + mix + "; start spot " + book.startSpots() + ", VIX " + cfg.vix()
+                + "; margin config " + cfg.margin().fingerprint().substring(0, 12));
         written.forEach((name, sha) -> System.out.println("  " + sha + "  " + name));
+    }
+
+    private static void ticks(Map<String, String> f) {
+        var bars = riskengine.replayer.ticks.NormalisedBars.read(Path.of(req(f, "bars")));
+        var vix = riskengine.replayer.ticks.NormalisedBars.read(Path.of(req(f, "vix")));
+        var ticks = riskengine.replayer.ticks.TickBuilder.build(f.getOrDefault("underlying", "NIFTY"), bars, vix,
+                date(f, "from"), date(f, "to"), 1);
+        int n = Integer.parseInt(f.getOrDefault("partitions", "4"));
+        Path dir = Path.of(req(f, "out"));
+        List<Path> files = riskengine.replayer.ticks.TickPublisher.publishToFiles(ticks, dir, n);
+        System.out.println("wrote " + ticks.size() + " ticks (tick_seq " + ticks.get(0).tickSeq() + ".." + ticks.get(ticks.size() - 1).tickSeq()
+                + ", VIX " + vix.resolution() + ") to each of " + files.size() + " partition logs in " + dir);
     }
 
     private static Map<String, String> flags(String[] a) {

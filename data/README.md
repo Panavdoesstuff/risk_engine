@@ -28,9 +28,17 @@ $R instruments --bhavcopy data/raw/fo03JUN2024bhav.csv --lots data/raw/fo_mktlot
 $R bars --in data/raw/<nifty-file>.csv     --from 2024-06-03 --to 2024-06-04 --out data/processed/NIFTY-1m.csv
 $R bars --in data/raw/<vix-file>.csv       --from 2024-05-01 --to 2024-06-04 --out data/processed/INDIAVIX.csv
 
-$R seed --instruments data/processed/instruments-2024-06-03.csv --out data/seed --seed 42 --accounts 1000
+# Cash is sized with the margin engine, so the seed needs the 3 June India VIX close:
+VIX=$(grep '^2024-06-03' data/processed/INDIAVIX.csv | tail -1 | cut -d, -f5)
+$R seed --instruments data/processed/instruments-2024-06-03.csv --vix "$VIX" --out data/seed --seed 42 --accounts 1000
+
+# Replay ticks for 4 June, written to every partition log (run once; it refuses to overwrite):
+$R ticks --bars data/processed/NIFTY-1m.csv --vix data/processed/INDIAVIX.csv \
+         --from 2024-06-04 --to 2024-06-04 --partitions 4 --out data/processed/logs
 ```
+
+With daily VIX, the VIX file must include 3 June: ticks on 4 June use the last value known at the time, which is 3 June's close.
 
 `bars` accepts a header with OPEN/HIGH/LOW/CLOSE plus DATETIME (or TIMESTAMP), or DATE + TIME, or DATE alone (daily). Timestamps without an offset are read as IST. Each output gets a `.meta` file with the resolution, row count, missing session minutes and a SHA-256.
 
-`seed` prints the SHA-256 of each file it writes; run it twice and the hashes match.
+`seed` prints the SHA-256 of each file it writes; run it twice and the hashes match. `book.meta` records the margin config hash, spot and VIX it was sized with: change the margin config and the cash balances change.

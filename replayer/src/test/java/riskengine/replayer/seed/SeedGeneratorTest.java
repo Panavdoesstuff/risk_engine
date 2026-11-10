@@ -14,6 +14,12 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import java.util.TreeMap;
+import riskengine.events.Tick;
+import riskengine.margin.AccountBook;
+import riskengine.margin.MarginConfig;
+import riskengine.margin.ReferenceMarginEngine;
+import riskengine.margin.UnderlyingParams;
 import riskengine.ref.Instrument;
 import riskengine.ref.InstrumentType;
 
@@ -49,8 +55,14 @@ class SeedGeneratorTest {
         return BigDecimal.valueOf(Math.round(v * 100), 2);
     }
 
+    static final BigDecimal VIX = new BigDecimal("21.50");
+
+    private static SeedConfig config(long seed, int n) {
+        return SeedConfig.defaults(seed, n, AS_OF, VIX);
+    }
+
     private static SeededBook book(long seed, int n) {
-        return SeedGenerator.generate(universe(), SeedConfig.defaults(seed, n, AS_OF));
+        return SeedGenerator.generate(universe(), config(seed, n));
     }
 
     // ---------------------------------------------------------------- M1 gate
@@ -69,7 +81,7 @@ class SeedGeneratorTest {
     void inputOrderDoesNotMatter() {
         List<Instrument> shuffled = new ArrayList<>(universe());
         java.util.Collections.reverse(shuffled);
-        var cfg = SeedConfig.defaults(7, 500, AS_OF);
+        var cfg = config(7, 500);
         assertEquals(SeedWriter.positionsCsv(SeedGenerator.generate(universe(), cfg)),
                 SeedWriter.positionsCsv(SeedGenerator.generate(shuffled, cfg)));
     }
@@ -140,17 +152,92 @@ class SeedGeneratorTest {
 
     @Test
     void bankNiftyStillWorksWhenAskedFor() {
-        var d = SeedConfig.defaults(42, 500, AS_OF);
-        var both = new java.util.TreeMap<>(Map.of("NIFTY", 70, "BANKNIFTY", 30));
-        var cfg = new SeedConfig(d.seed(), d.accounts(), d.asOf(), d.proxyMarginRate(), d.thinFundedBp(), d.archetypeWeights(), both);
+        // Needs a margin config that knows Bank Nifty; the checked-in one is Nifty only.
+        var nifty = MarginConfig.defaults().params("NIFTY");
+        var bank = new UnderlyingParams("BANKNIFTY", nifty.dividendYield(), nifty.volScale(), nifty.priceScanRange(), nifty.volScanRange(),
+                nifty.extremeMultiple(), nifty.extremeCoverage(), nifty.shortOptionMinimum(), nifty.exposureMargin(), nifty.minVol());
+        var margin = new MarginConfig(MarginConfig.defaults().riskFreeRate(), new TreeMap<>(Map.of("NIFTY", nifty, "BANKNIFTY", bank)),
+                MarginConfig.defaults().thresholds());
+        var cfg = config(42, 500).withUnderlyingWeights(new TreeMap<>(Map.of("NIFTY", 70, "BANKNIFTY", 30)), margin);
         assertEquals(List.of("BANKNIFTY", "NIFTY"), SeedGenerator.generate(universe(), cfg).underlyings());
+    }
+
+    // ---------------------------------------------------------------- funding from the real margin engine
+
+    /** Recomputes every account's starting utilisation with the reference engine, independently of the generator. */
+    private static Map<String, Double> startingUtilisation(SeededBook b) {
+        Map<String, TreeMap<String, riskengine.margin.Position>> positions = new TreeMap<>();
+        for (var p : b.positions()) {
+            positions.computeIfAbsent(p.accountId(), k -> new TreeMap<>()).put(p.instrumentId(), new riskengine.margin.Position(p.qty(), p.avgPrice()));
+        }
+        List<AccountBook> books = b.accounts().stream()
+                .map(a -> new AccountBook(a.accountId(), a.cashBalance(), BigDecimal.ZERO, positions.get(a.accountId()))).toList();
+        var engine = new ReferenceMarginEngine(b.config().margin(), universe(), books);
+        long valuation = java.time.OffsetDateTime.parse(AS_OF + "T15:30:00+05:30").toInstant().toEpochMilli();
+        engine.onTick(new Tick(1, valuation, "NIFTY", b.startSpots().get("NIFTY"), b.config().vix()));
+        Map<String, Double> out = new TreeMap<>();
+        for (var a : b.accounts()) out.put(a.accountId(), engine.latest(a.accountId()).utilisation());
+        return out;
+    }
+
+    @Test
+    void everyAccountStartsInsideItsTargetUtilisationBand() {
+        SeededBook b = book(42, 5_000);
+        Map<String, Double> util = startingUtilisation(b);
+        int thin = 0;
+        for (var a : b.accounts()) {
+            double u = util.get(a.accountId());
+            String who = a + " at " + u;
+            // Cash is rounded down to the paisa, so utilisation can sit a hair above the drawn target.
+            double slack = 1e-6;
+            if (a.archetype() == Archetype.OPTION_BUYER) {
+                assertEquals(0.0, u, 0.0, who + ": a buyer who has paid needs no margin");
+            } else if (a.thinFunded()) {
+                thin++;
+                assertTrue(u >= 0.80 && u < 0.99, who + ": thin shorts start at 80-99%");
+            } else if (a.archetype() == Archetype.HEDGED_SPREAD) {
+                assertTrue(u >= 0.20 && u < 0.55 + slack, who + ": spreads start comfortably under 60%");
+            } else {
+                assertTrue(u >= 0.30 && u < 0.70 + slack, who + ": funded shorts and futures start at 30-70%");
+            }
+        }
+        assertTrue(thin > 300, "enough thin accounts to matter: " + thin);
+    }
+
+    @Test
+    void bookMetaRecordsTheMarginConfigItWasSizedWith(@TempDir Path dir) throws IOException {
+        SeededBook b = book(42, 200);
+        SeedWriter.write(b, "x", dir);
+        String meta = Files.readString(dir.resolve("book.meta"));
+        assertTrue(meta.contains("generator_version=2\n"));
+        assertTrue(meta.contains("margin_config_sha256=" + MarginConfig.defaults().fingerprint() + "\n"), meta);
+        assertTrue(meta.contains("start_vix=21.50\n") && meta.contains("start_spot={NIFTY="), meta);
+
+        // A different margin config gives a different fingerprint AND different cash balances.
+        var n = MarginConfig.defaults().params("NIFTY");
+        var wider = new UnderlyingParams("NIFTY", n.dividendYield(), n.volScale(), 0.12, n.volScanRange(), n.extremeMultiple(),
+                n.extremeCoverage(), n.shortOptionMinimum(), n.exposureMargin(), n.minVol());
+        var other = new MarginConfig(MarginConfig.defaults().riskFreeRate(), new TreeMap<>(Map.of("NIFTY", wider)), MarginConfig.defaults().thresholds());
+        assertNotEquals(MarginConfig.defaults().fingerprint(), other.fingerprint());
+        SeededBook b2 = SeedGenerator.generate(universe(), config(42, 200).withUnderlyingWeights(new TreeMap<>(Map.of("NIFTY", 100)), other));
+        assertEquals(SeedWriter.positionsCsv(b), SeedWriter.positionsCsv(b2), "same positions");
+        assertNotEquals(SeedWriter.accountsCsv(b), SeedWriter.accountsCsv(b2), "different cash");
+    }
+
+    @Test
+    void impliedSpotPutsTheNearFutureAtItsSettlePrice() {
+        SeededBook b = book(1, 10);
+        BigDecimal spot = b.startSpots().get("NIFTY");
+        // universe(): near future settles at 23,370 on 27 June; carry over 24 days at (6.9% - 1.2%) is about 87 points
+        assertTrue(spot.compareTo(new BigDecimal("23270")) > 0 && spot.compareTo(new BigDecimal("23295")) < 0, spot.toString());
+        assertEquals(2, spot.scale());
     }
 
     @Test
     void failsClearlyWhenNoUsableChain() {
         List<Instrument> futuresOnly = universe().stream().filter(i -> i.type() == InstrumentType.FUT).toList();
         var e = assertThrows(IllegalArgumentException.class,
-                () -> SeedGenerator.generate(futuresOnly, SeedConfig.defaults(1, 10, AS_OF)));
+                () -> SeedGenerator.generate(futuresOnly, config(1, 10)));
         assertTrue(e.getMessage().contains("option chain"));
     }
 

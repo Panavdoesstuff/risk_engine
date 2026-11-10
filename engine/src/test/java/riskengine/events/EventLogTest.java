@@ -26,6 +26,26 @@ class EventLogTest {
     }
 
     @Test
+    void everyEventTypeRoundTripsThroughOneFixedLine() {
+        Event order = new OrderRequest("O-1", "A0000001", "NIFTY-20240613-23000-CE", OrderRequest.Side.SELL, 50, OrderRequest.Origin.USER, 111);
+        Event fill = new Fill("BF-9", "O-1", "A0000001", "NIFTY-20240613-23000-CE", -50, new BigDecimal("266.70"), 222);
+        Event sq = new SquareOffResult("A0000001:E1:NIFTY-20240613-23000-CE:0", "A0000001", "NIFTY-20240613-23000-CE", SquareOffResult.Status.REJECTED, 333);
+        assertEquals("ORDER|v1|O-1|A0000001|NIFTY-20240613-23000-CE|SELL|50|USER|111", EventCodec.encode(order));
+        assertEquals("FILL|v1|BF-9|O-1|A0000001|NIFTY-20240613-23000-CE|-50|266.70|222", EventCodec.encode(fill));
+        assertEquals("SQOFF|v1|A0000001:E1:NIFTY-20240613-23000-CE:0|A0000001|NIFTY-20240613-23000-CE|REJECTED|333", EventCodec.encode(sq));
+        for (Event e : List.of(order, fill, sq, tick(1, "23000"))) assertEquals(e, EventCodec.decode(EventCodec.encode(e)));
+    }
+
+    @Test
+    void identifiersThatWouldBreakTheLineFormatAreRejected() {
+        assertThrows(IllegalArgumentException.class, () -> new Fill("a|b", "O", "A", "I", 1, BigDecimal.ONE, 0));
+        assertThrows(IllegalArgumentException.class, () -> new Fill("F", "O", "A\nX", "I", 1, BigDecimal.ONE, 0));
+        assertThrows(IllegalArgumentException.class, () -> new Fill("F", "O", "A", "I", 0, BigDecimal.ONE, 0));
+        assertThrows(IllegalArgumentException.class, () -> new OrderRequest("O", "A", "I", OrderRequest.Side.BUY, -5, OrderRequest.Origin.USER, 0));
+        assertThrows(IllegalArgumentException.class, () -> EventCodec.decode("FILL|v1|F|O|A|I|1|1"));
+    }
+
+    @Test
     void inMemoryLogReadsInOrderWithOffsets() {
         try (EventLog log = new InMemoryEventLog()) {
             for (int i = 0; i < 5; i++) assertEquals(i, log.append(tick(i, "23000")));

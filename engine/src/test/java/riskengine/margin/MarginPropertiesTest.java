@@ -108,14 +108,47 @@ class MarginPropertiesTest {
     void removeUndoesAdd(@ForAll @Size(min = 1, max = 6) List<@From("legs") Leg> legs) {
         MarketState m = market(23_000, 20);
         AccountVector v = vector(legs, m);
-        for (Leg l : legs) v.remove(l.qty(), RiskArray.compute(l.instrument(), m, GRID, CFG.riskFreeRate()));
-        for (int s = 0; s < ScenarioGrid.SIZE; s++) assertEquals(0, v.scenarioLoss(s), 1e-6);
-        assertEquals(0, v.netOptionValue(), 1e-6);
-        assertEquals(0, v.shortOptionNotional(), 1e-6);
-        assertEquals(0, v.exposureNotional(), 1e-6);
+        for (Leg l : legs) {
+            RiskArray a = RiskArray.compute(l.instrument(), m, GRID, CFG.riskFreeRate());
+            v.remove(l.qty(), a.price(), a); // add(qty, a) opened it at the mark
+        }
+        for (double c : v.components()) assertEquals(0, c, 1e-6);
+    }
+
+    @Property(tries = 300)
+    void tickDeltaEqualsRebuildingAtTheNewPrices(@ForAll @Size(min = 1, max = 8) List<@From("legs") Leg> legs,
+                                                 @ForAll @DoubleRange(min = 18_000, max = 28_000) double spot1,
+                                                 @ForAll @DoubleRange(min = 18_000, max = 28_000) double spot2,
+                                                 @ForAll @DoubleRange(min = 10, max = 40) double vix2) {
+        MarketState m1 = market(spot1, 20), m2 = market(spot2, vix2);
+        AccountVector incremental = new AccountVector("NIFTY"), rebuilt = new AccountVector("NIFTY");
+        for (Leg l : legs) {
+            RiskArray a1 = RiskArray.compute(l.instrument(), m1, GRID, CFG.riskFreeRate());
+            RiskArray a2 = RiskArray.compute(l.instrument(), m2, GRID, CFG.riskFreeRate());
+            incremental.add(l.qty(), 23_000, a1);
+            incremental.applyTick(l.qty(), a1, a2);       // vector += qty x (new - old)
+            rebuilt.add(l.qty(), 23_000, a2);
+        }
+        assertTrue(incremental.maxDifference(rebuilt) < 1e-6, "drift " + incremental.maxDifference(rebuilt));
     }
 
     // ---------------------------------------------------------------- component checks
+
+    @Test
+    void futuresProfitAndLossReachesAvailableMargin() {
+        Instrument fut = Instrument.of("NIFTY", InstrumentType.FUT, LocalDate.of(2024, 6, 27), null, 25, BigDecimal.ONE, BigDecimal.ONE, 1);
+        RiskArray now = RiskArray.compute(fut, market(21_000, 20), GRID, CFG.riskFreeRate());
+        // Long 25 bought 2,000 points above the current futures price: Rs 50,000 already lost.
+        AccountVector v = new AccountVector("NIFTY").add(25, now.price() + 2_000, now);
+        MarginResult r = MarginCalculator.compute(v, CFG, 300_000, 0);
+        assertEquals(-50_000, r.futuresMtm(), 1e-6);
+        assertEquals(250_000, r.available(), 1e-6);
+        // A short at the same entry price has gained the same amount.
+        AccountVector s = new AccountVector("NIFTY").add(-25, now.price() + 2_000, now);
+        assertEquals(350_000, MarginCalculator.compute(s, CFG, 300_000, 0).available(), 1e-6);
+        // Opened at the mark: nothing gained or lost yet.
+        assertEquals(0, MarginCalculator.compute(new AccountVector("NIFTY").add(25, now), CFG, 1, 0).futuresMtm(), 1e-9);
+    }
 
     @Test
     void futuresMarginIsTheFullScanRangeMovePlusExposure() {

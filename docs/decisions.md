@@ -22,11 +22,11 @@ NSE lot revisions apply to newly listed months while existing contracts keep the
 **6. Determinism: SplitMix64 per account, integer basis points, BigDecimal money.**
 `java.util.Random` is spec-stable, but a ten-line generator we own (and test against the published reference vector) is easier to defend. Each account gets its own stream derived from (seed, index), so adding accounts or changing one archetype never reshuffles the others. Random factors are integer basis points, so there is no double→decimal conversion anywhere (`Double.toString` output changed in JDK 19). All output is sorted canonically with LF line endings and no timestamps.
 
-**7. Collateral is sized with a proxy margin (12% of notional) until M2 exists.**
+**7. Collateral is sized with a proxy margin (12% of notional) until M2 exists.** *(Superseded by #30: cash is now sized with the real margin engine.)*
 Naked shorts: 12% × ref × qty for one side (a straddle's risk is roughly one side). Spreads: max loss. Buyers: 10–100% of premium as free cash. 25% of naked sellers get 102–115% of proxy ("thin"); others 140–300%. *Cost:* after M2, re-check that "thin" accounts really are near 100% utilisation under the real margin model and recalibrate `proxyMarginRate` if not.
 
 **8. `cash_balance` is cash after opening premiums settle.**
-Sellers have received premium, buyers have paid it. Available margin in M2 = cash + net option value, which then starts equal to the collateral the generator intended.
+Sellers have received premium, buyers have paid it. *(The second half of the original entry, "available = cash + net option value", was replaced by #23: net option value is subtracted from the requirement instead.)*
 
 **9. Daily VIX bars are stamped at 15:30 IST.**
 A daily close isn't known until the close. Stamping it at 00:00 would let a replayer use 4 June's close at 09:15 — look-ahead bias that would flatter the margin calls.
@@ -100,3 +100,59 @@ Thresholds are 80/100/120%, inclusive. The 3-tick confirmation stops one bad pri
 
 **29. The worked example is checked by a second, independent implementation.**
 Writing the expected numbers by running the Java code would prove nothing. `scripts/straddle_example.py` recomputes the straddle from the textbook formulas using Python's own `erfc`, and the doc's numbers come from it.
+
+## M3: Follow-ups from M2, then the ordered log and incremental recompute
+
+**30. The seed generator sizes each account's cash with the real margin engine. (Replaces #7.)**
+The 12% proxy was wrong for hedged spreads: they started at 217–4,344% utilisation and would all have been squared off on the first tick. Now the generator computes each account's required margin at the previous close and sets cash so the account starts at a drawn target:
+- thin short sellers: 80–99%
+- other short sellers and futures accounts: 30–70% *(my choice; you specified the other three)*
+- hedged spreads: 20–55%
+- option buyers: 0%, always, because a long-only account needs no margin. They keep 10–100% of their premium as free cash.
+
+Consequences:
+- The seed command now needs the as-of day's India VIX close (`--vix`). Spot is implied from the near-month futures settle by removing cost of carry, so that future starts at exactly zero profit and loss. `--spot` overrides it.
+- A different margin config gives different cash balances. `book.meta` records `margin_config_sha256` (a hash of every parameter value, ignoring comments and key order), plus the spot and VIX used. Same instruments + same seed + same config hash = same bytes.
+- Cash is rounded *down* to the paisa, so rounding can only push an account a hair above its target, never below the band's floor.
+
+**31. Required margin is clamped at zero.**
+Both parts (risk requirement and exposure margin) are already non-negative, so the clamp never changes a number today. It is there so the rule is stated in code and survives future changes to the formula.
+
+**32. Unsettled futures profit and loss counts toward available margin. (Fixes a gap in M2.)**
+M2 only looked forward: a long future that had already fallen 2,000 points showed its scenario risk but not the loss already taken. Options don't have this problem, because their premium is in cash and their current value is in net option value. Now: available = cash + collateral + (current futures value − what was paid). The exchange settles this in cash every evening; intraday we count it as if it had been. The straddle example is unaffected (no futures).
+
+**33. One piece of bookkeeping code for fills, shared by the reference engine and the shards.**
+Options: premium moves in cash at once. Futures: no cash when opening; closing realises the profit or loss on the closed part into cash. Average price: weighted average when adding, unchanged when reducing, restarts at the fill price when a position flips through zero. Averages keep 6 decimals with a fixed rounding rule. Because both engines call the same code, a mismatch between them can only be a margin-maths bug, never a bookkeeping one.
+
+**34. Only ticks feed the level tracker.**
+"Three consecutive ticks over 100%" should mean three market readings. A fill updates positions, cash and the account's latest margin figure immediately, but it is not a reading and can't escalate or clear a level. M5 will revisit this for square-off fills.
+
+**35. Four event types, one text line each. Orders and square-off results are accepted and ignored for now.**
+`Tick`, `OrderRequest`, `Fill`, `SquareOffResult` all have a fixed field order and encode to the same bytes every time. Identifiers containing `|` or a line break are refused when the event is created. Shards apply ticks and fills fully. `OrderRequest` waits for M4's pre-trade check and `SquareOffResult` for M5; until then they advance the offset and change nothing else, so logs written now stay readable.
+
+**36. Partition = Kafka's own key hash (murmur2) of the account id, modulo N.**
+Using the same function as Kafka's default partitioner means that in M4, producing with key = account id lands where our code expects, with no custom partitioner to configure. A test checks 100,000 cases against the Kafka client library; that library is a test-only dependency and the engine still has none.
+
+**37. Each shard keeps two indexes and prices only what it holds.**
+`holders` (instrument → accounts holding it) says whose numbers to adjust when an instrument reprices. `byUnderlying` (underlying → instruments held) says what to reprice on a tick. When the last holder closes out, the instrument drops out of both and is no longer priced. Pricing is per shard; there is no shared pricer to synchronise on.
+
+**38. Incremental update, with a full rebuild and check every 100 ticks.**
+On a tick, each holder's vector gets `qty × (new array − old array)`. Floating-point rounding means that is not bit-identical to rebuilding from positions, so every K = 100 ticks the shard rebuilds every vector, compares, and fails loudly if any component differs by more than one paisa. It then *continues from the rebuilt values*, so rounding error can never accumulate for more than K ticks. Worst difference seen in the 10,000-portfolio test: 7.5e-9 rupees. K is part of the shard's behaviour: change it and the hashes change.
+
+**39. `stateHash()` is SHA-256 over the whole shard state in sorted order, with doubles hashed by their exact bits.**
+It covers the next offset, last tick, markets, risk arrays, and per account: cash, positions, vectors, level, streak counters, latest margin result, plus every fill id seen. Strings are length-prefixed and decimals are hashed by value (2.50 = 2.5). Counters that exist only for diagnostics (largest drift seen, duplicate count) are left out. Bit-exact hashing only works because of the rules in #40.
+
+**40. The "banned in shard code" list is enforced by a test that reads the source.**
+`DeterminismRulesTest` scans the shard, margin, pricing and events packages (comments stripped) for wall-clock calls, random number sources, hash-ordered collections (`HashMap`, `HashSet`, `Map.of`, …), `Math.exp/log/pow` (use `StrictMath`) and parallel streams. A second test proves the scanner catches each kind. It is a grep, not a proof, but it stops the common mistakes at build time.
+
+**41. Shards refuse out-of-order input rather than trying to fix it.**
+An offset gap, a tick whose `tick_seq` doesn't increase, or a fill for an account the shard doesn't own is an error that stops the shard. Guessing would produce a state nobody can reproduce.
+
+**42. Which scenario is reported as "worst" can differ between engines when two scenarios tie.**
+For a futures-only account, scenarios that differ only in volatility lose exactly the same amount, so rounding dust decides which number is reported. The loss itself agrees. Within one shard the label is still deterministic.
+
+**43. Ticks are built from minute bars using only what was known at the time, and written once by one writer.**
+A minute bar's close becomes a tick when the minute ends (the 09:15 bar is a tick at 09:16). VIX is joined "as of": each tick takes the latest value already known. With daily VIX, every tick on 4 June uses 3 June's close and only the 15:30 tick sees 4 June's. The replayer writes every tick to every partition with the same `tick_seq` and refuses to write into existing log files.
+
+**44. The speed-up is reported against two baselines, because one number would mislead.**
+Per tick, 10,000 accounts × 5 positions: naive (every account reprices every position) 35.3 ms; full recompute (price each instrument once, rebuild every vector) 4.3 ms; incremental 1.4 ms. So 25× over naive and 3.1× over full recompute. Most of the 25× comes from pricing each instrument once per tick instead of once per position. That is a property of risk arrays, which the full recompute has too. The incremental delta itself is worth about 3×, and part of that is the shard holding direct references where the reference engine does map lookups. JMH runs through its annotation processor and `org.openjdk.jmh.Main`, with no Gradle plugin.

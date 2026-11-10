@@ -3,7 +3,6 @@ package riskengine.margin;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
-import java.util.HashSet;
 import java.util.Properties;
 import java.util.Set;
 import java.util.SortedMap;
@@ -23,6 +22,29 @@ public record MarginConfig(double riskFreeRate, SortedMap<String, UnderlyingPara
         return p;
     }
 
+    /**
+     * SHA-256 of every parameter value in a fixed order. Two configs with the same fingerprint produce the
+     * same margins; comments and key order in the properties file don't affect it. The seeded book records
+     * this, because its cash balances are sized with the margin engine.
+     */
+    public String fingerprint() {
+        StringBuilder sb = new StringBuilder("margin-config-v1\n").append("riskFree=").append(riskFreeRate).append('\n');
+        for (UnderlyingParams u : underlyings.values()) {
+            sb.append(u.underlying()).append('|').append(u.dividendYield()).append('|').append(u.volScale()).append('|')
+              .append(u.priceScanRange()).append('|').append(u.volScanRange()).append('|').append(u.extremeMultiple()).append('|')
+              .append(u.extremeCoverage()).append('|').append(u.shortOptionMinimum()).append('|').append(u.exposureMargin()).append('|')
+              .append(u.minVol()).append('\n');
+        }
+        sb.append("thresholds=").append(thresholds.warning()).append('|').append(thresholds.marginCall()).append('|')
+          .append(thresholds.squareOff()).append('|').append(thresholds.confirmTicks()).append('\n');
+        try {
+            byte[] d = java.security.MessageDigest.getInstance("SHA-256").digest(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(d);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     /** The checked-in defaults: {@code riskengine/margin.properties} on the classpath. */
     public static MarginConfig defaults() {
         try (InputStream in = MarginConfig.class.getResourceAsStream("/riskengine/margin.properties")) {
@@ -36,7 +58,7 @@ public record MarginConfig(double riskFreeRate, SortedMap<String, UnderlyingPara
     }
 
     public static MarginConfig load(Properties p) {
-        Set<String> used = new HashSet<>();
+        Set<String> used = new TreeSet<>();
         Reader r = new Reader(p, used);
         SortedMap<String, UnderlyingParams> und = new TreeMap<>();
         for (String u : r.string("underlyings").split(",")) {
