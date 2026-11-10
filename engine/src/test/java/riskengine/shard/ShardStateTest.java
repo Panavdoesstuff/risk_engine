@@ -76,7 +76,7 @@ class ShardStateTest {
     void incrementalEqualsFullOn10kRandomPortfolios() {
         List<AccountBook> books = Fixtures.books(10_000, 2024_06_04L);
         List<Event> events = Fixtures.events(books, 60, 50, 99);
-        ShardState shard = shard(0, books, new ShardConfig(7, 0.01)); // drift-check and re-base every 7 ticks
+        ShardState shard = shard(0, books, new ShardConfig(7, 0.01)); // every account is rebuilt and checked once per 7 ticks
         ReferenceMarginEngine reference = new ReferenceMarginEngine(Fixtures.CFG, INS, books);
 
         int transitions = 0, fills = 0;
@@ -93,7 +93,11 @@ class ShardStateTest {
 
         assertTrue(transitions > 1_000, "the path must actually move accounts between levels, got " + transitions);
         assertTrue(fills > 2_000 && shard.duplicateFills() > 50, "fills " + fills + ", duplicates " + shard.duplicateFills());
-        assertEquals(60 / 7, shard.fullRecomputes());
+        // 60 ticks with a 7-tick cycle: 8 whole cycles rebuild every account 8 times; the 4 leftover ticks
+        // (tick_seq 57..60, remainders 1..4) rebuild indexes 1, 2, 3, 4 mod 7.
+        long leftover = java.util.stream.IntStream.range(0, 10_000).filter(i -> i % 7 >= 1 && i % 7 <= 4).count();
+        assertEquals(8L * 10_000 + leftover, shard.accountRebuilds());
+        assertEquals((10_000 + 6) / 7, shard.maxRebuildsInOneTick(), "no spike: never more than ceil(n / K) accounts on one tick");
         assertTrue(shard.maxDriftSeen() < 1e-4, "drift " + shard.maxDriftSeen());
         System.out.printf("M3 gate: 10,000 portfolios, %d events (%d fills), %d level changes, max drift %.3e rupees%n",
                 events.size(), fills, transitions, shard.maxDriftSeen());
@@ -191,6 +195,55 @@ class ShardStateTest {
         for (Event e : events) expected.addAll(reference.apply(e));
         expected.sort(Comparator.comparingLong(MarginEvent::tickSeq).thenComparing(MarginEvent::accountId));
         assertSameTransitions(expected, firstEvents);
+    }
+
+    @Test
+    void rollingRebuildVisitsEveryAccountOncePerCycleAndNeverSpikes() {
+        List<AccountBook> books = Fixtures.books(1_000, 21);
+        List<Event> events = Fixtures.events(books, 250, 0, 22);
+        ShardState s = shard(0, books, ShardConfig.defaults());
+        long o = 0, before = 0;
+        for (Event e : events) {
+            s.apply(new LoggedEvent(o++, e));
+            long now = s.accountRebuilds();
+            // index % 100 == tick_seq % 100 picks exactly 10 of 1,000 accounts on every tick
+            assertEquals(10, now - before, "tick " + ((Tick) e).tickSeq());
+            before = now;
+        }
+        assertEquals(10, s.maxRebuildsInOneTick());
+        assertEquals(250 * 10, s.accountRebuilds());
+    }
+
+    @Test
+    void theRebuildScheduleIsPartOfTheBehaviourSoItChangesTheHash() {
+        List<AccountBook> books = Fixtures.books(500, 7);
+        List<Event> events = Fixtures.events(books, 40, 10, 8);
+        // Same log, different cycle length: accounts re-base on different ticks, so some vectors differ in
+        // their last bits and the hash (which is bit-exact) differs. Same cycle: same hash.
+        assertEquals(replay(books, events, new ShardConfig(7, 0.01)), replay(books, events, new ShardConfig(7, 0.01)));
+        assertNotEquals(replay(books, events, new ShardConfig(7, 0.01)), replay(books, events, new ShardConfig(13, 0.01)));
+    }
+
+    @Test
+    void replayFromTheStartMatchesAShardThatNeverStopped() {
+        // The schedule depends only on tick_seq and the account list, not on a counter of ticks seen. So a
+        // shard fed the log in two sittings is bit-identical to one fed in a single run.
+        List<AccountBook> books = Fixtures.books(300, 31);
+        List<Event> events = Fixtures.events(books, 230, 5, 32);
+        ShardState oneGo = shard(3, books, ShardConfig.defaults());
+        ShardState twoSittings = shard(3, books, ShardConfig.defaults());
+        try (EventLog log = new InMemoryEventLog()) {
+            events.forEach(log::append);
+            new ShardRunner(oneGo, log, e -> {}).runToEnd();
+        }
+        try (EventLog log = new InMemoryEventLog()) {
+            ShardRunner r = new ShardRunner(twoSittings, log, e -> {});
+            events.subList(0, 777).forEach(log::append);
+            r.runToEnd();
+            events.subList(777, events.size()).forEach(log::append);
+            r.runToEnd();
+        }
+        assertEquals(oneGo.stateHash(), twoSittings.stateHash());
     }
 
     // ---------------------------------------------------------------- indexes, drift check, guards

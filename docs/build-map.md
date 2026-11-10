@@ -100,7 +100,7 @@ Start `docs/decisions.md` on day one. Write one short entry every time you choos
 - [x] Shard-local pricing on each tick (no shared pricer)
 - [x] `holders` reverse index and `byUnderlying` map
 - [x] Delta update: `accountVector += qty × (newArray − oldArray)`
-- [x] Full recompute every K ticks, assert drift within tolerance *(K = 100, tolerance one paisa)*
+- [x] Full recompute every K ticks, assert drift within tolerance *(K = 100, tolerance one paisa; done as a rolling rebuild, 1% of accounts per tick, so no tick pays for the whole shard: decisions.md #38)*
 - [x] Banned in shard code: `System.currentTimeMillis()`, `Random`, iterating unordered sets; use event timestamps and sorted collections *(enforced by `DeterminismRulesTest`)*
 - [x] `stateHash()` over sorted shard state
 - [x] JMH benchmark: naive vs incremental, per tick

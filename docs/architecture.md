@@ -54,7 +54,7 @@ Inside a shard, on each tick:
 
 1. `byUnderlying[underlying]` lists the instruments held here. Each is repriced once.
 2. `holders[instrument]` lists who holds it. Each holder's vector gets `qty × (new array − old array)`.
-3. Every 100 ticks: rebuild every vector from positions, check the difference is under a paisa, continue from the rebuilt values.
+3. Rolling rebuild: the accounts where `index % 100 == tick_seq % 100` are rebuilt from positions, checked to be within a paisa of their incremental values, and continue from the rebuilt values. Every account gets its turn once per 100 ticks; no tick rebuilds the whole shard.
 4. Margin and level for each affected account, in account-id order.
 
 A fill updates the position, cash and vector at once (same bookkeeping code as the reference engine) and maintains both indexes. Duplicate fill ids are ignored.

@@ -106,7 +106,7 @@ Writing the expected numbers by running the Java code would prove nothing. `scri
 **30. The seed generator sizes each account's cash with the real margin engine. (Replaces #7.)**
 The 12% proxy was wrong for hedged spreads: they started at 217–4,344% utilisation and would all have been squared off on the first tick. Now the generator computes each account's required margin at the previous close and sets cash so the account starts at a drawn target:
 - thin short sellers: 80–99%
-- other short sellers and futures accounts: 30–70% *(my choice; you specified the other three)*
+- other short sellers and futures accounts: 30–70%
 - hedged spreads: 20–55%
 - option buyers: 0%, always, because a long-only account needs no margin. They keep 10–100% of their premium as free cash.
 
@@ -125,7 +125,7 @@ M2 only looked forward: a long future that had already fallen 2,000 points showe
 Options: premium moves in cash at once. Futures: no cash when opening; closing realises the profit or loss on the closed part into cash. Average price: weighted average when adding, unchanged when reducing, restarts at the fill price when a position flips through zero. Averages keep 6 decimals with a fixed rounding rule. Because both engines call the same code, a mismatch between them can only be a margin-maths bug, never a bookkeeping one.
 
 **34. Only ticks feed the level tracker.**
-"Three consecutive ticks over 100%" should mean three market readings. A fill updates positions, cash and the account's latest margin figure immediately, but it is not a reading and can't escalate or clear a level. M5 will revisit this for square-off fills.
+"Three consecutive ticks over 100%" should mean three market readings. A fill updates positions, cash and the account's latest margin figure immediately, but it is not a reading and can't escalate or clear a level. *Agreed for M5:* a fill will be allowed to lower an account's level (a square-off leg that brings it back under a threshold should show at once) but never to raise it.
 
 **35. Four event types, one text line each. Orders and square-off results are accepted and ignored for now.**
 `Tick`, `OrderRequest`, `Fill`, `SquareOffResult` all have a fixed field order and encode to the same bytes every time. Identifiers containing `|` or a line break are refused when the event is created. Shards apply ticks and fills fully. `OrderRequest` waits for M4's pre-trade check and `SquareOffResult` for M5; until then they advance the offset and change nothing else, so logs written now stay readable.
@@ -136,8 +136,13 @@ Using the same function as Kafka's default partitioner means that in M4, produci
 **37. Each shard keeps two indexes and prices only what it holds.**
 `holders` (instrument → accounts holding it) says whose numbers to adjust when an instrument reprices. `byUnderlying` (underlying → instruments held) says what to reprice on a tick. When the last holder closes out, the instrument drops out of both and is no longer priced. Pricing is per shard; there is no shared pricer to synchronise on.
 
-**38. Incremental update, with a full rebuild and check every 100 ticks.**
-On a tick, each holder's vector gets `qty × (new array − old array)`. Floating-point rounding means that is not bit-identical to rebuilding from positions, so every K = 100 ticks the shard rebuilds every vector, compares, and fails loudly if any component differs by more than one paisa. It then *continues from the rebuilt values*, so rounding error can never accumulate for more than K ticks. Worst difference seen in the 10,000-portfolio test: 7.5e-9 rupees. K is part of the shard's behaviour: change it and the hashes change.
+**38. Incremental update, with a rolling rebuild and check: 1% of accounts per tick.** *(Changed after M3 review; it was "rebuild everything every 100 ticks".)*
+On a tick, each holder's vector gets `qty × (new array − old array)`. Floating-point rounding means that is not bit-identical to rebuilding from positions, so accounts are also rebuilt from positions on a schedule: on each tick, the accounts where `index % 100 == tick_seq % 100`. Each one is compared with its incremental value, the shard fails loudly if any component differs by more than one paisa, and the account *continues from the rebuilt values*. So every account is rebuilt once per K = 100 ticks and rounding error can never accumulate for longer.
+- *Why rolling:* rebuilding the whole shard on one tick made every 100th tick several times slower than the rest. That is exactly the kind of spike a p99 latency target punishes (M6). Rolling does the same total work, spread evenly: never more than ⌈accounts ÷ K⌉ rebuilds on a tick.
+- *What "index" is:* the account's position in the shard's sorted list of account ids. The list is fixed when the shard starts, so the index never changes.
+- *Why it stays deterministic:* the schedule depends only on `tick_seq` (which is in the log) and that fixed list. There is no "ticks since last rebuild" counter any more, so there is one less piece of state to hash and to snapshot.
+- K is part of the shard's behaviour: change it and the hashes change (a test checks this). Hashes from before this change don't match hashes after it.
+- Worst difference seen in the 10,000-portfolio test: see results.md.
 
 **39. `stateHash()` is SHA-256 over the whole shard state in sorted order, with doubles hashed by their exact bits.**
 It covers the next offset, last tick, markets, risk arrays, and per account: cash, positions, vectors, level, streak counters, latest margin result, plus every fill id seen. Strings are length-prefixed and decimals are hashed by value (2.50 = 2.5). Counters that exist only for diagnostics (largest drift seen, duplicate count) are left out. Bit-exact hashing only works because of the rules in #40.

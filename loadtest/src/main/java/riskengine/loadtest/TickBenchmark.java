@@ -30,7 +30,7 @@ import riskengine.shard.ShardState;
  *   <li>{@code fullRecompute}: each instrument is priced once, then every account's vector is rebuilt
  *       from its positions (ReferenceMarginEngine).</li>
  *   <li>{@code incremental}: each instrument is priced once, then each holder's vector is adjusted by
- *       qty x (new - old) (ShardState, including its drift check every 100 ticks).</li>
+ *       qty x (new - old) (ShardState, including its rolling rebuild: 1% of accounts rebuilt and checked per tick).</li>
  * </ul>
  */
 @State(Scope.Thread)

@@ -39,8 +39,10 @@ import riskengine.ref.Instrument;
  *
  * <p><b>Incremental update.</b> On a tick, each held instrument is repriced once (shard-local, no shared
  * pricer) and each holder's vector is adjusted by {@code qty x (newArray - oldArray)}. Nothing is rebuilt
- * from positions except every K ticks, when the shard rebuilds everything, checks the incremental numbers
- * against the rebuild, and carries on from the rebuilt values.
+ * from positions except by the rolling rebuild: on every tick, the accounts whose index (position in this
+ * shard's sorted account list) satisfies {@code index % K == tick_seq % K} are rebuilt, checked against
+ * their incremental numbers, and carry on from the rebuilt values. Every account is rebuilt once per K
+ * ticks, and no single tick pays for the whole shard.
  *
  * <p><b>Determinism rules for this package</b> (enforced by DeterminismRulesTest): no wall clock, no
  * random numbers, no hash-ordered collections, StrictMath only. Same log in, same state out, bit for bit.
@@ -93,6 +95,8 @@ public final class ShardState {
     private final ShardConfig shardCfg;
     private final SortedMap<String, Instrument> instruments = new TreeMap<>();
     private final TreeMap<String, Account> accounts = new TreeMap<>();
+    /** Accounts in id order; an account's position here is its index for the rolling rebuild. */
+    private final Account[] byIndex;
     private final TreeMap<String, TreeMap<String, Holding>> holders = new TreeMap<>();
     private final TreeMap<String, TreeSet<String>> byUnderlying = new TreeMap<>();
     private final TreeMap<String, TreeMap<String, Account>> accountsByUnderlying = new TreeMap<>();
@@ -103,10 +107,10 @@ public final class ShardState {
 
     private long nextOffset;
     private long lastTickSeq = Long.MIN_VALUE;
-    private int ticksSinceFullRecompute;
     // Diagnostics, not part of the hashed state.
     private double maxDriftSeen;
-    private long fullRecomputes;
+    private long accountRebuilds;
+    private int maxRebuildsInOneTick;
     private long duplicateFills;
 
     /** @param books only the accounts this shard owns (see {@link Partitioner}) */
@@ -126,6 +130,7 @@ public final class ShardState {
                 link(a, i, e.getValue());
             }
         }
+        byIndex = accounts.values().toArray(new Account[0]);
     }
 
     private static SortedMap<String, AccountBook> byId(Collection<AccountBook> books) {
@@ -189,10 +194,7 @@ public final class ShardState {
                 }
             }
         }
-        if (++ticksSinceFullRecompute >= shardCfg.fullRecomputeEveryTicks()) {
-            fullRecomputeAndCheck();
-            ticksSinceFullRecompute = 0;
-        }
+        rollingRebuildAndCheck(t.tickSeq());
 
         List<MarginEvent> events = new ArrayList<>();
         if (affected != null) {
@@ -309,20 +311,30 @@ public final class ShardState {
         return v;
     }
 
-    private void fullRecomputeAndCheck() {
-        for (Account a : accounts.values()) {
+    /**
+     * Rebuilds and checks the accounts whose turn it is on this tick: index % K == tick_seq % K. Which
+     * accounts are rebuilt depends only on the log (tick_seq) and the shard's fixed account list, so two
+     * replays of the same log rebuild the same accounts on the same ticks.
+     */
+    private void rollingRebuildAndCheck(long tickSeq) {
+        int k = shardCfg.rebuildCycleTicks();
+        int rebuilt = 0;
+        for (int i = (int) Math.floorMod(tickSeq, (long) k); i < byIndex.length; i += k) {
+            Account a = byIndex[i];
+            rebuilt++;
             for (AccountVector incremental : a.vectors.values()) {
                 AccountVector full = rebuild(a, incremental.underlying());
                 double drift = incremental.maxDifference(full);
                 if (drift > maxDriftSeen) maxDriftSeen = drift;
                 if (!(drift <= shardCfg.driftToleranceRupees())) {
                     throw new IllegalStateException("shard " + shardId + " account " + a.id + " drifted by " + drift
-                            + " rupees (tolerance " + shardCfg.driftToleranceRupees() + ") at tick " + lastTickSeq);
+                            + " rupees (tolerance " + shardCfg.driftToleranceRupees() + ") at tick " + tickSeq);
                 }
                 incremental.copyFrom(full);
             }
         }
-        fullRecomputes++;
+        accountRebuilds += rebuilt;
+        if (rebuilt > maxRebuildsInOneTick) maxRebuildsInOneTick = rebuilt;
     }
 
     // ---------------------------------------------------------------- state hash
@@ -333,7 +345,7 @@ public final class ShardState {
      */
     public String stateHash() {
         Hasher h = new Hasher();
-        h.num(shardId).num(nextOffset).num(lastTickSeq).num(ticksSinceFullRecompute);
+        h.num(shardId).num(nextOffset).num(lastTickSeq);
         h.num(markets.size());
         for (MarketState m : markets.values()) h.str(m.underlying()).dbl(m.spot()).dbl(m.vol()).num(m.logTimeMillis());
         h.num(arrays.size());
@@ -460,8 +472,14 @@ public final class ShardState {
         return maxDriftSeen;
     }
 
-    public long fullRecomputes() {
-        return fullRecomputes;
+    /** Total account rebuilds done by the rolling rebuild so far. */
+    public long accountRebuilds() {
+        return accountRebuilds;
+    }
+
+    /** Most accounts rebuilt on any single tick: at most ceil(accounts / K), so there is no spike tick. */
+    public int maxRebuildsInOneTick() {
+        return maxRebuildsInOneTick;
     }
 
     public long duplicateFills() {
