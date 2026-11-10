@@ -1,0 +1,72 @@
+# Local infrastructure for the risk engine.
+#   docker compose up -d        -> starts everything, applies migrations, creates topics
+# Prometheus + Grafana are added in M6.
+
+name: risk-engine
+
+x-redpanda-image: &redpanda-image docker.redpanda.com/redpandadata/redpanda:v24.2.7
+
+services:
+  postgres:
+    image: postgres:16.4
+    environment:
+      POSTGRES_DB: risk
+      POSTGRES_USER: risk
+      POSTGRES_PASSWORD: risk
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U risk -d risk"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  flyway:
+    image: flyway/flyway:10.20.1
+    command: -url=jdbc:postgresql://postgres:5432/risk -user=risk -password=risk -connectRetries=30 migrate
+    volumes: ["./db/migrations:/flyway/sql:ro"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  redpanda:
+    image: *redpanda-image
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports: ["19092:19092", "9644:9644"]
+    volumes: [redpanda:/var/lib/redpanda/data]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  topic-init:
+    image: *redpanda-image
+    entrypoint: ["/bin/bash", "/scripts/create-topics.sh"]
+    environment:
+      RPK_BROKERS: redpanda:9092
+      ENGINE_PARTITIONS: ${ENGINE_PARTITIONS:-4}
+    volumes: ["./scripts/create-topics.sh:/scripts/create-topics.sh:ro"]
+    depends_on:
+      redpanda: { condition: service_healthy }
+    restart: "no"
+
+  redis:
+    image: redis:7.4-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:
+  redpanda:

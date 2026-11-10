@@ -1,0 +1,13 @@
+.gradle/
+build/
+out/
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Market data and generated books are reproducible from scripts; never commit them.
+data/raw/
+data/processed/
+data/seed/
+!data/README.md
