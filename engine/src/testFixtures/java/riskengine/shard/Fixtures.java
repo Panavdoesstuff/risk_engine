@@ -18,15 +18,18 @@ import riskengine.margin.Position;
 import riskengine.ref.Instrument;
 import riskengine.ref.InstrumentType;
 
-/** Random but reproducible books and event streams. (Randomness is fine in tests; it is banned in shard code.) */
-final class Fixtures {
-    static final MarginConfig CFG = MarginConfig.defaults();
-    static final long T0 = OffsetDateTime.parse("2024-06-04T09:16:00+05:30").toInstant().toEpochMilli();
+/**
+ * Random but reproducible books and event streams. (Randomness is fine in tests; it is banned in shard code.)
+ * Published as the engine's test fixtures so other modules' tests can drive shards with the same data.
+ */
+public final class Fixtures {
+    public static final MarginConfig CFG = MarginConfig.defaults();
+    public static final long T0 = OffsetDateTime.parse("2024-06-04T09:16:00+05:30").toInstant().toEpochMilli();
 
     private Fixtures() {}
 
     /** Two futures and two option expiries, strikes 21,000 to 25,000 in steps of 100: 166 instruments. */
-    static List<Instrument> instruments() {
+    public static List<Instrument> instruments() {
         List<Instrument> out = new ArrayList<>();
         out.add(Instrument.of("NIFTY", InstrumentType.FUT, LocalDate.of(2024, 6, 27), null, 25, BigDecimal.ONE, BigDecimal.ONE, 1));
         out.add(Instrument.of("NIFTY", InstrumentType.FUT, LocalDate.of(2024, 7, 25), null, 25, BigDecimal.ONE, BigDecimal.ONE, 1));
@@ -40,14 +43,14 @@ final class Fixtures {
         return out;
     }
 
-    static BigDecimal plausiblePrice(Instrument i, SplittableRandom r) {
+    public static BigDecimal plausiblePrice(Instrument i, SplittableRandom r) {
         return i.type() == InstrumentType.FUT
                 ? BigDecimal.valueOf(2_290_000 + r.nextInt(80_000), 2)   // 22,900.00 .. 23,700.00
                 : BigDecimal.valueOf(500 + r.nextInt(60_000), 2);        // 5.00 .. 605.00
     }
 
     /** n accounts with 1-6 random positions each. */
-    static List<AccountBook> books(int n, long seed) {
+    public static List<AccountBook> books(int n, long seed) {
         SplittableRandom r = new SplittableRandom(seed);
         List<Instrument> ins = instruments();
         List<AccountBook> out = new ArrayList<>(n);
@@ -67,9 +70,9 @@ final class Fixtures {
 
     /**
      * A choppy, falling market with fills mixed in: opens, partial closes, exact closes, flips, duplicates,
-     * plus a few order and square-off events (which shards must accept and ignore for now).
+     * plus a few user orders (pre-trade checked) and square-off results (ignored until M5).
      */
-    static List<Event> events(List<AccountBook> books, int ticks, int fillsPerTick, long seed) {
+    public static List<Event> events(List<AccountBook> books, int ticks, int fillsPerTick, long seed) {
         SplittableRandom r = new SplittableRandom(seed);
         List<Instrument> ins = instruments();
         List<Event> out = new ArrayList<>();
@@ -98,7 +101,10 @@ final class Fixtures {
                     continue;
                 }
                 if (kind < 8) {
-                    out.add(new OrderRequest("O" + t + "-" + f, accountId, ins.get(r.nextInt(ins.size())).id(), OrderRequest.Side.BUY, 25,
+                    // Side and size vary without drawing random numbers, so the rest of the stream (and the
+                    // M3 numbers that came from it) is exactly what it was before orders were checked.
+                    out.add(new OrderRequest("O" + t + "-" + f, accountId, ins.get(r.nextInt(ins.size())).id(),
+                            (t + f) % 2 == 0 ? OrderRequest.Side.BUY : OrderRequest.Side.SELL, 25L * (1 + (t * 7 + f) % 40),
                             OrderRequest.Origin.USER, time));
                     continue;
                 }

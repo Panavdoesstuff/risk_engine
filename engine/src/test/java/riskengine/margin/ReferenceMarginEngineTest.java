@@ -52,7 +52,7 @@ class ReferenceMarginEngineTest {
         crash().forEach(log::append);
         var engine = new ReferenceMarginEngine(MarginExampleTest.CONFIG, INSTRUMENTS, BOOKS);
         List<MarginEvent> events = new ArrayList<>();
-        assertEquals(log.endOffset(), engine.run(log, 0, events::add));
+        assertEquals(log.endOffset(), engine.run(log, 0, o -> events.add((MarginEvent) o)));
         return events;
     }
 

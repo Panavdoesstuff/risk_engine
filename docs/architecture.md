@@ -1,6 +1,6 @@
 # Architecture
 
-*Filled in as milestones land. Current state: M3.*
+*Filled in as milestones land. Current state: M4 part 1 (shards on Redpanda, order API, security). Postgres writers, broker and square-off are not built yet.*
 
 ```
 replayer ──ticks (every partition, global tick_seq)──▶ engine-events[0..N-1] ──▶ ShardRunner × N
@@ -60,3 +60,47 @@ Inside a shard, on each tick:
 A fill updates the position, cash and vector at once (same bookkeeping code as the reference engine) and maintains both indexes. Duplicate fill ids are ignored.
 
 `stateHash()` is SHA-256 over the sorted state with doubles hashed bit-for-bit. Same log in, same hash out. `DeterminismRulesTest` keeps clocks, randomness, hash-ordered collections and platform-dependent maths out of the packages a shard executes.
+
+## Shards on Redpanda and the order API (M4 part 1)
+
+```
+client ──POST /orders (JWT, X-Request-Id)──▶ api ──OrderRequest──▶ engine-events[hash(account) % N]
+   ▲                                          │                           │
+   │                                          │ Redis: rate limit,        ▼
+   └──GET /orders/{id}── order status (Redis) │ request ids,        ShardRunner p (host)
+                              ▲               │ order status          pre-trade check
+                              │                                           │
+                        engine-out listener ◀── engine-out[p] ◀── DECISION / MARGIN lines
+```
+
+**A request, in order.** Each step can refuse; nothing later runs if it does.
+
+| Step | Where | Refusal |
+| --- | --- | --- |
+| Token signed by us (HS256), right issuer, not expired, has role (+ account for a trader) | Spring Security | 401 |
+| User within their token bucket | `RateLimitFilter` → Redis Lua script | 429 (503 if Redis is down) |
+| Role may use the endpoint | Spring Security | 403 |
+| Body and `X-Request-Id` well formed | controller | 400 |
+| Trader owns the account | controller | 403 |
+| Request id not used before by this user | `ReplayGuard` → Redis `SET NX EX` | 409 |
+| Written to the account's partition, acknowledged | `RedpandaLogs` | 503 |
+| | | **202** + order id |
+
+**Then the shard decides.** The order is one more event in the account's partition. When the shard thread reaches it, the account's state is exactly "everything before this order in the log", so the margin check needs no lock. It prices the trade at the mark from the latest tick, counts earlier accepted-but-unfilled orders as filled (reservations), and publishes `ACCEPTED` or `REJECTED` with a reason. The API's listener copies the decision into the order's status.
+
+**`host`.** `ShardHost` builds N `ShardState`s (each with the accounts that hash to it), gives each a `RedpandaEventLog` for its partition and starts N `ShardRunner` threads. Outputs go to the same-numbered partition of `engine-out`. If a shard cannot apply an event it stops and the host exits; it never skips. On start it replays from offset 0 (snapshots are M6), which reproduces the same state hash and republishes the same lines.
+
+**Run it locally.**
+
+```bash
+docker compose up -d
+export JWT_SECRET=<at least 32 characters>
+./gradlew :host:run --args="--instruments data/processed/instruments-2024-06-03.csv --book data/seed"
+./gradlew :api:bootRun
+TOKEN=$(./gradlew -q :api:devToken --args="trader alice A0000001")
+curl -i -X POST localhost:8080/orders -H "Authorization: Bearer $TOKEN" -H "X-Request-Id: $(uuidgen)" \
+     -H "Content-Type: application/json" \
+     -d '{"accountId":"A0000001","instrumentId":"NIFTY-20240627-FUT","side":"BUY","qty":25}'
+```
+
+Orders are rejected with `NO_MARKET` until at least one tick is in the log. Writing ticks to Redpanda from the replayer is not wired up yet (it writes files); the tests write them directly.

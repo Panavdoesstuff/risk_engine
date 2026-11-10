@@ -128,7 +128,7 @@ Options: premium moves in cash at once. Futures: no cash when opening; closing r
 "Three consecutive ticks over 100%" should mean three market readings. A fill updates positions, cash and the account's latest margin figure immediately, but it is not a reading and can't escalate or clear a level. *Agreed for M5:* a fill will be allowed to lower an account's level (a square-off leg that brings it back under a threshold should show at once) but never to raise it.
 
 **35. Four event types, one text line each. Orders and square-off results are accepted and ignored for now.**
-`Tick`, `OrderRequest`, `Fill`, `SquareOffResult` all have a fixed field order and encode to the same bytes every time. Identifiers containing `|` or a line break are refused when the event is created. Shards apply ticks and fills fully. `OrderRequest` waits for M4's pre-trade check and `SquareOffResult` for M5; until then they advance the offset and change nothing else, so logs written now stay readable.
+`Tick`, `OrderRequest`, `Fill`, `SquareOffResult` all have a fixed field order and encode to the same bytes every time. Identifiers containing `|` or a line break are refused when the event is created. Shards apply ticks and fills fully. `OrderRequest` waits for M4's pre-trade check *(now built: decisions 48–50)* and `SquareOffResult` for M5; until then they advance the offset and change nothing else, so logs written now stay readable.
 
 **36. Partition = Kafka's own key hash (murmur2) of the account id, modulo N.**
 Using the same function as Kafka's default partitioner means that in M4, producing with key = account id lands where our code expects, with no custom partitioner to configure. A test checks 100,000 cases against the Kafka client library; that library is a test-only dependency and the engine still has none.
@@ -145,7 +145,7 @@ On a tick, each holder's vector gets `qty × (new array − old array)`. Floatin
 - Worst difference seen in the 10,000-portfolio test: 7.5e-9 rupees, unchanged.
 
 **39. `stateHash()` is SHA-256 over the whole shard state in sorted order, with doubles hashed by their exact bits.**
-It covers the next offset, last tick, markets, risk arrays, and per account: cash, positions, vectors, level, streak counters, latest margin result, plus every fill id seen. Strings are length-prefixed and decimals are hashed by value (2.50 = 2.5). Counters that exist only for diagnostics (largest drift seen, duplicate count) are left out. Bit-exact hashing only works because of the rules in #40.
+It covers the next offset, last tick, markets, risk arrays, and per account: cash, positions, vectors, level, streak counters, latest margin result, plus every fill id seen. *(M4 adds reserved orders and every order id seen: decisions 49–50.)* Strings are length-prefixed and decimals are hashed by value (2.50 = 2.5). Counters that exist only for diagnostics (largest drift seen, duplicate count) are left out. Bit-exact hashing only works because of the rules in #40.
 
 **40. The "banned in shard code" list is enforced by a test that reads the source.**
 `DeterminismRulesTest` scans the shard, margin, pricing and events packages (comments stripped) for wall-clock calls, random number sources, hash-ordered collections (`HashMap`, `HashSet`, `Map.of`, …), `Math.exp/log/pow` (use `StrictMath`) and parallel streams. A second test proves the scanner catches each kind. It is a grep, not a proof, but it stops the common mistakes at build time.
@@ -161,3 +161,71 @@ A minute bar's close becomes a tick when the minute ends (the 09:15 bar is a tic
 
 **44. The speed-up is reported against two baselines, because one number would mislead.**
 Per tick, 10,000 accounts × 5 positions: naive (every account reprices every position) 37.0 ms; full recompute (price each instrument once, rebuild every vector) 4.2 ms; incremental 1.35 ms. So 27× over naive and 3.1× over full recompute (numbers re-measured after #38 changed to a rolling rebuild). Most of the 27× comes from pricing each instrument once per tick instead of once per position. That is a property of risk arrays, which the full recompute has too. The incremental delta itself is worth about 3×, and part of that is the shard holding direct references where the reference engine does map lookups. JMH runs through its annotation processor and `org.openjdk.jmh.Main`, with no Gradle plugin.
+
+## M4 part 1: shards on Redpanda, the order API, security
+
+**45. Two new modules: `host` and `api`. The engine still has no dependencies.**
+`host` holds everything that talks to Redpanda: the `EventLog` implementation, the `engine-out` publisher and `ShardHost`, the process that runs one shard thread per partition. `api` is the Spring Boot order API. *Differs from the build map's layout*, which had no module for this: putting the Kafka client inside `engine/` would have ended "plain Java, no framework in the hot path". The engine's random-book test fixtures are now shared with the other modules' tests (Gradle test fixtures).
+
+**46. A Redpanda partition is an `EventLog`; the partition's offsets are the log's offsets.**
+The shard code did not change (decision 13 held). What makes it safe:
+- *Offsets have no gaps* because the topic is never compacted, never expires, and is not written with transactions (transaction markers use up offsets). The shard still checks every offset.
+- *No consumer group.* Each shard's consumer is assigned its one partition and seeks to the offset the shard's state asks for. A committed offset on the broker would be a second opinion about where the shard is, and after a crash the two could disagree.
+- *Writes wait for the broker* (`acks=all`) with idempotence on, so a retry inside the client can't duplicate or reorder.
+- *The partition is always set explicitly* from `Partitioner`. The record key (account id) is only there for people reading the topic. Decision 36 still holds (same hash as Kafka's), but nothing depends on a client's partitioner setting.
+- Starting against a topic with the wrong number of partitions is refused (same reason as decision 10).
+- An empty read means "nothing yet", not "end of log"; a live shard keeps asking.
+
+**47. A shard host always replays from offset 0, so `engine-out` is at-least-once.**
+There are no snapshots until M6. Replaying gives bit-identical state (tested: same hashes as an in-memory run, and again after a restart) and publishes every output a second time, byte for byte. Consumers must cope: order decisions are keyed by order id, margin events by (account, tick_seq), which is what the Postgres unique constraints in decision 11 are for. *Cost:* restart time grows with the log until M6.
+
+**48. The pre-trade rule.** Take the account as it would be if this order filled now at the current mark. Accept if
+- utilisation would be below 100% (the margin-call threshold) and available margin would not be negative; or
+- the order improves the account's excess (available − required) by at least one paisa.
+
+Why each part:
+- *Below 100%:* an order may take an account into the warning band but never into a margin call.
+- *Available not negative:* a long option needs no margin, so utilisation alone would let an account with ₹3,000 buy any amount of options. It has to be able to pay the premium.
+- *The second branch* lets an account that is already over its limit close or hedge. Without it, a margin-called account could not reduce its own risk.
+- *One paisa, not zero:* buying an option whose mark is 0.00 changes nothing, and "not worse" would then be decided by floating-point dust. The reference engine and the shard disagreed on exactly such an order in the 10,000-portfolio test until this was added.
+- *Priced at the mark from the latest tick before the order in the log*, rounded to the paisa. Orders are market orders (no limit price yet). The decision records which tick it used.
+
+**49. Accepted orders reserve margin until they fill.**
+Nothing has filled when the next order arrives, so a check against positions alone would pass two identical orders against the same free margin. Each accepted order is kept as a reservation (order id → instrument, remaining quantity); every later check treats reservations as already filled; a fill with that order id releases what it filled. Reservations do not affect the account's reported margin or level, only pre-trade checks. They are part of the state hash.
+*Open, needs a decision:* only fills release a reservation. If the broker rejects or cancels an accepted order, its margin stays reserved forever. That needs a new event (order closed without filling) when the broker arrives in M5. And until M5 nothing produces fills for accepted orders at all, so in a live run reservations only build up.
+
+**50. Orders the shard can't check are rejections with a reason, never exceptions.**
+Unknown account, unknown instrument, quantity that is not a whole number of lots, no tick yet: each is a `REJECTED` decision with a reason code. Decision 41 (stop on bad input) is for the log's own integrity (offset gaps, tick order). Anything a user can cause must not stop a shard. An order id seen before is ignored (decided once). Orders with origin `SQUARE_OFF` are the engine's own and still wait for M5.
+
+**51. The reference engine does the pre-trade check too, in its own way.**
+The shard adjusts a copy of the account's vector; the reference rebuilds from hypothetical positions. They share only the rule and the bookkeeping (`PreTradeCheck`, `PositionAccounting`). Every test of the check runs both and asserts they agree, and part 2's stress harness can compare decisions as well as margins.
+
+**52. What shards publish: one text line per output on `engine-out`, shard p to partition p.**
+`MARGIN|v1|…` for a level change and `DECISION|v1|…` for an order decision, same style as the input log. Rupees to 4 decimals, utilisation to 6, converted exactly from the double's bits and then rounded (never via `Double.toString`, see decision 6). The lines are a report; they can't restore engine state. Sends are not awaited one at a time (the shard must not wait on the network per output); a failed send stops the host.
+
+**53. The order API is asynchronous: 202 means "written to the log", not "accepted by risk".**
+POST /orders validates, writes an `OrderRequest` to the account's partition, waits for the broker's acknowledgement and answers 202 with an order id. The shard decides when it reaches the order, in line with that account's fills and the market's ticks. That is the whole answer to "how does a pre-trade check work without locks": one thread owns the account, and the partition's order is the only order there is. A test shows the same order accepted or rejected depending only on whether a crash tick sits before or after it in the log.
+
+**54. Order id = "O-" + first 128 bits of SHA-256(user, request id).**
+If a write times out, the API can't know whether it landed. It gives the request id back, the client retries, and the retry gets the *same* order id. If both writes landed, the shard sees one id twice and decides it once (decision 50). A random id would have made two orders.
+
+**55. JWT: HS256 with a shared secret; the API only verifies.**
+Claims: `iss`, `sub` (user), `role` (`trader` or `risk-ops`), `account` (traders), `exp`. Rejected with 401: wrong key, wrong issuer, expired, any algorithm other than HS256 (including `none`), edited claims, and correctly signed tokens missing a role, an account (for a trader), a subject or an expiry. The secret comes from `JWT_SECRET`, must be at least 32 characters, and has no default: the API won't start without it. There is no login endpoint; `./gradlew :api:devToken` prints tokens for local use. *Cost:* a shared secret means anything that can verify tokens can also mint them. Fine for one service; with a separate login service it should be RS256 with a published public key.
+
+**56. Roles. Trader: own account only. Risk-ops: read any order, place none.**
+A trader's token names one account; an order for any other account is 403 and never reaches the log. Risk-ops can read every order but can't place user orders. *Not built yet:* risk-ops block/unblock and manual square-off from the build map. They change account state inside the shard, which arrives with M5. Reading someone else's order returns the same 404 as an order that doesn't exist, so order ids can't be probed. Any path not listed is denied.
+
+**57. Rate limit: a token bucket per user in Redis, one Lua script.**
+Each user has a bucket of 20 tokens refilled at 10 a second *(both numbers are guesses)*. Read, refill, take and write happen in one script, which Redis runs atomically, so two requests can't both take the last token; the clock is Redis's own, so API instances agree. It runs right after the token is verified and before any other work, so a refused request costs one Redis call. Refusals are 429 with `Retry-After`. If Redis is down the API answers 503 rather than letting everything through. *Gap:* requests without a valid token are not limited (there is no user to count them against); that needs a per-IP limit at a proxy.
+
+**58. Replay protection: `SET request:{user}:{id} NX EX 24h`.**
+Every order needs an `X-Request-Id`. The first use claims it in one atomic Redis command; a repeat inside 24 hours is 409, with the id of the order it first created. Ids are per user, so nobody can use up someone else's. The same id with a different body is still a replay. After the 24 hours, a repeat would get the same order id (decision 54) and the shard would ignore it.
+
+**59. The API checks form; the shard checks meaning.**
+API (400): strict JSON (unknown fields, `"25"` for 25 and 25.5 for a whole number are errors), narrow patterns for account and instrument ids, side, 1 ≤ qty ≤ 100,000. The patterns also guarantee that nothing a caller sends can contain the `|` or line breaks that separate fields and events in the log. Shard (rejection): does the account exist, is the instrument listed, is the quantity whole lots, is there margin. The API holds no reference data and never computes margin. Callers can't set the order id or the origin. Error bodies never contain class names or parser messages.
+
+**60. Order status for GET /orders/{id} lives in Redis for now.**
+The API writes PENDING (only if no status is there); a listener on `engine-out` writes the decision (always). Whichever lands first, a decision is never overwritten by PENDING. Records expire after 7 days. This is a convenience view, not a record; part 2's Postgres writers produce the durable `orders` rows, and the endpoint could read from there instead.
+
+**61. The Redpanda and API tests run against real containers; nothing is mocked.**
+Testcontainers starts the same Redpanda image as docker-compose, plus Redis. The API tests go through the real Spring Security filter chain, real Redis scripts, a real broker and real shards. They need Docker (CI has it). *Cost:* about a minute of test time.

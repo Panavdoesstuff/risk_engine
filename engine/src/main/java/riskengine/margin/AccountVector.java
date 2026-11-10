@@ -138,6 +138,12 @@ public final class AccountVector {
         futuresCost = other.futuresCost;
     }
 
+    public AccountVector copy() {
+        AccountVector c = new AccountVector(underlying);
+        c.copyFrom(this);
+        return c;
+    }
+
     /** Largest absolute difference between any component of this vector and {@code other}, in rupees. */
     public double maxDifference(AccountVector other) {
         double[] a = components(), b = other.components();

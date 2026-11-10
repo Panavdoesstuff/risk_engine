@@ -20,6 +20,8 @@ import riskengine.events.InMemoryEventLog;
 import riskengine.events.LoggedEvent;
 import riskengine.events.Tick;
 import riskengine.margin.AccountBook;
+import riskengine.margin.EngineOutput;
+import riskengine.margin.OrderDecision;
 import riskengine.margin.MarginEvent;
 import riskengine.margin.MarginResult;
 import riskengine.margin.Position;
@@ -58,10 +60,24 @@ class ShardStateTest {
         assertClose(full.utilisation(), incremental.utilisation(), who + " utilisation");
     }
 
-    static void assertSameTransitions(List<MarginEvent> full, List<MarginEvent> incremental) {
-        assertEquals(full.size(), incremental.size(), "number of level changes");
+    /** Level changes must match exactly; order decisions must agree on accept/reject and reason. */
+    static void assertSameOutputs(List<EngineOutput> full, List<EngineOutput> incremental) {
+        assertEquals(full.size(), incremental.size(), "number of outputs");
         for (int i = 0; i < full.size(); i++) {
-            MarginEvent f = full.get(i), s = incremental.get(i);
+            if (full.get(i) instanceof OrderDecision f) {
+                OrderDecision s = (OrderDecision) incremental.get(i);
+                String who = "order " + f.orderId();
+                assertEquals(f.orderId(), s.orderId());
+                assertEquals(f.accountId(), s.accountId(), who);
+                assertEquals(f.reason(), s.reason(), who);
+                assertEquals(f.accepted(), s.accepted(), who);
+                assertEquals(f.lastTickSeq(), s.lastTickSeq(), who);
+                assertClose(f.requiredAfter(), s.requiredAfter(), who + " required after");
+                assertClose(f.availableAfter(), s.availableAfter(), who + " available after");
+                assertClose(f.utilisationAfter(), s.utilisationAfter(), who + " utilisation after");
+                continue;
+            }
+            MarginEvent f = (MarginEvent) full.get(i), s = (MarginEvent) incremental.get(i);
             assertEquals(f.accountId(), s.accountId());
             assertEquals(f.tickSeq(), s.tickSeq());
             assertEquals(f.from(), s.from(), f.accountId() + " tick " + f.tickSeq());
@@ -79,13 +95,20 @@ class ShardStateTest {
         ShardState shard = shard(0, books, new ShardConfig(7, 0.01)); // every account is rebuilt and checked once per 7 ticks
         ReferenceMarginEngine reference = new ReferenceMarginEngine(Fixtures.CFG, INS, books);
 
-        int transitions = 0, fills = 0;
+        int transitions = 0, fills = 0, accepted = 0, rejected = 0;
         long offset = 0;
         for (Event e : events) {
-            List<MarginEvent> full = reference.apply(e);
-            List<MarginEvent> incremental = shard.apply(new LoggedEvent(offset++, e));
-            assertSameTransitions(full, incremental);
-            transitions += full.size();
+            List<EngineOutput> full = reference.apply(e);
+            List<EngineOutput> incremental = shard.apply(new LoggedEvent(offset++, e));
+            assertSameOutputs(full, incremental);
+            for (EngineOutput o : full) {
+                if (o instanceof OrderDecision d) {
+                    if (d.accepted()) accepted++;
+                    else rejected++;
+                } else {
+                    transitions++;
+                }
+            }
             if (e instanceof Fill) fills++;
             if (e instanceof Tick t && t.tickSeq() % 10 == 0) compareEveryAccount(books, reference, shard);
         }
@@ -99,8 +122,9 @@ class ShardStateTest {
         assertEquals(8L * 10_000 + leftover, shard.accountRebuilds());
         assertEquals((10_000 + 6) / 7, shard.maxRebuildsInOneTick(), "no spike: never more than ceil(n / K) accounts on one tick");
         assertTrue(shard.maxDriftSeen() < 1e-4, "drift " + shard.maxDriftSeen());
-        System.out.printf("M3 gate: 10,000 portfolios, %d events (%d fills), %d level changes, max drift %.3e rupees%n",
-                events.size(), fills, transitions, shard.maxDriftSeen());
+        assertTrue(accepted > 10 && rejected > 10, "pre-trade checks must go both ways: " + accepted + " accepted, " + rejected + " rejected");
+        System.out.printf("M3 gate: 10,000 portfolios, %d events (%d fills), %d level changes, %d orders accepted, %d rejected, max drift %.3e rupees%n",
+                events.size(), fills, transitions, accepted, rejected, shard.maxDriftSeen());
     }
 
     static void compareEveryAccount(List<AccountBook> books, ReferenceMarginEngine reference, ShardState shard) {
@@ -109,11 +133,22 @@ class ShardStateTest {
             assertEquals(reference.positions(id), shard.positions(id), id + " positions");
             assertEquals(0, reference.cash(id).compareTo(shard.cash(id)), id + " cash");
             assertEquals(reference.level(id), shard.level(id), id + " level");
+            assertEquals(reference.pendingOrders(id), shard.pendingOrders(id), id + " reserved orders");
             assertSameResult(reference.latest(id), shard.latest(id), id);
         }
     }
 
     // ---------------------------------------------------------------- M3 gate, part 2
+
+    /**
+     * Shards run in parallel, so their outputs have no order between them. Sort for comparison: level
+     * changes by (tick, account), then order decisions by order id.
+     */
+    static final Comparator<EngineOutput> CANONICAL = Comparator
+            .comparing((EngineOutput o) -> o instanceof MarginEvent ? 0 : 1)
+            .thenComparing(o -> o instanceof MarginEvent m ? m.tickSeq() : 0L)
+            .thenComparing(EngineOutput::accountId)
+            .thenComparing(o -> o instanceof OrderDecision d ? d.orderId() : "");
 
     static String replay(List<AccountBook> books, List<Event> events, ShardConfig cfg) {
         ShardState s = shard(3, books, cfg);
@@ -153,7 +188,7 @@ class ShardStateTest {
         List<Event> events = Fixtures.events(books, 50, 20, 12);
 
         List<String> firstHashes = null;
-        List<MarginEvent> firstEvents = null;
+        List<EngineOutput> firstEvents = null;
         for (int run = 0; run < 2; run++) {
             // The "replayer": every tick to every partition, account events to the owner's partition.
             List<FileEventLog> logs = new ArrayList<>();
@@ -163,12 +198,12 @@ class ShardStateTest {
                 else logs.forEach(l -> l.append(e));
             }
             List<ShardRunner> runners = new ArrayList<>();
-            List<List<MarginEvent>> sinks = new ArrayList<>();
+            List<List<EngineOutput>> sinks = new ArrayList<>();
             for (int p = 0; p < n; p++) {
                 int shardId = p;
                 List<AccountBook> mine = books.stream().filter(b -> Partitioner.partition(b.id(), n) == shardId).toList();
                 assertFalse(mine.isEmpty());
-                List<MarginEvent> sink = new ArrayList<>(); // written only by that shard's thread
+                List<EngineOutput> sink = new ArrayList<>(); // written only by that shard's thread
                 sinks.add(sink);
                 runners.add(new ShardRunner(shard(p, mine, ShardConfig.defaults()), logs.get(p), sink::add));
             }
@@ -177,9 +212,9 @@ class ShardStateTest {
             logs.forEach(FileEventLog::close);
 
             List<String> hashes = runners.stream().map(r -> r.state().stateHash()).toList();
-            List<MarginEvent> merged = new ArrayList<>();
+            List<EngineOutput> merged = new ArrayList<>();
             sinks.forEach(merged::addAll);
-            merged.sort(Comparator.comparingLong(MarginEvent::tickSeq).thenComparing(MarginEvent::accountId));
+            merged.sort(CANONICAL);
             if (run == 0) {
                 firstHashes = hashes;
                 firstEvents = merged;
@@ -191,10 +226,11 @@ class ShardStateTest {
         assertEquals(n, firstHashes.stream().distinct().count(), "different shards hold different accounts");
 
         ReferenceMarginEngine reference = new ReferenceMarginEngine(Fixtures.CFG, INS, books);
-        List<MarginEvent> expected = new ArrayList<>();
+        List<EngineOutput> expected = new ArrayList<>();
         for (Event e : events) expected.addAll(reference.apply(e));
-        expected.sort(Comparator.comparingLong(MarginEvent::tickSeq).thenComparing(MarginEvent::accountId));
-        assertSameTransitions(expected, firstEvents);
+        expected.sort(CANONICAL);
+        assertSameOutputs(expected, firstEvents);
+        assertTrue(expected.stream().anyMatch(o -> o instanceof OrderDecision), "the stream includes orders");
     }
 
     @Test

@@ -20,14 +20,18 @@ import riskengine.events.Tick;
 import riskengine.margin.AccountBook;
 import riskengine.margin.AccountVector;
 import riskengine.margin.MarginCalculator;
+import riskengine.margin.EngineOutput;
 import riskengine.margin.MarginConfig;
 import riskengine.margin.MarginEvent;
 import riskengine.margin.MarginLevel;
 import riskengine.margin.MarginResult;
 import riskengine.margin.MarginStatusTracker;
 import riskengine.margin.MarketState;
+import riskengine.margin.OrderDecision;
+import riskengine.margin.PendingOrder;
 import riskengine.margin.Position;
 import riskengine.margin.PositionAccounting;
+import riskengine.margin.PreTradeCheck;
 import riskengine.margin.RiskArray;
 import riskengine.margin.ScenarioGrid;
 import riskengine.margin.UnderlyingParams;
@@ -64,6 +68,8 @@ public final class ShardState {
         /** By underlying. Present only when the account holds that underlying AND it has ticked. */
         final TreeMap<String, AccountVector> vectors = new TreeMap<>();
         final TreeMap<String, Integer> heldPerUnderlying = new TreeMap<>();
+        /** Accepted orders waiting for fills, by order id. Their margin is reserved (see PreTradeCheck). */
+        final TreeMap<String, PendingOrder> pending = new TreeMap<>();
         final MarginStatusTracker tracker;
         MarginResult latest;
 
@@ -104,6 +110,7 @@ public final class ShardState {
     private final TreeMap<String, MarketState> markets = new TreeMap<>();
     private final TreeMap<String, ScenarioGrid> grids = new TreeMap<>();
     private final TreeSet<String> seenFillIds = new TreeSet<>();
+    private final TreeSet<String> seenOrderIds = new TreeSet<>();
 
     private long nextOffset;
     private long lastTickSeq = Long.MIN_VALUE;
@@ -112,6 +119,7 @@ public final class ShardState {
     private long accountRebuilds;
     private int maxRebuildsInOneTick;
     private long duplicateFills;
+    private long duplicateOrders;
 
     /** @param books only the accounts this shard owns (see {@link Partitioner}) */
     public ShardState(int shardId, MarginConfig cfg, ShardConfig shardCfg, Collection<Instrument> instruments, Collection<AccountBook> books) {
@@ -150,25 +158,28 @@ public final class ShardState {
 
     // ---------------------------------------------------------------- applying events
 
-    /** Applies the next event. Offsets must arrive in order with no gaps. Returns level changes (ticks only). */
-    public List<MarginEvent> apply(LoggedEvent le) {
+    /**
+     * Applies the next event. Offsets must arrive in order with no gaps. Returns what the shard has to say
+     * about it: level changes for a tick, the pre-trade decision for an order.
+     */
+    public List<EngineOutput> apply(LoggedEvent le) {
         if (le.offset() != nextOffset) {
             throw new IllegalStateException("shard " + shardId + " expected offset " + nextOffset + " but got " + le.offset());
         }
-        List<MarginEvent> out = switch (le.event()) {
+        List<EngineOutput> out = switch (le.event()) {
             case Tick t -> onTick(t);
             case Fill f -> {
                 onFill(f);
                 yield List.of();
             }
-            case OrderRequest o -> List.of();    // pre-trade check arrives in M4
+            case OrderRequest o -> onOrder(o);
             case SquareOffResult s -> List.of(); // square-off pipeline arrives in M5
         };
         nextOffset++;
         return out;
     }
 
-    private List<MarginEvent> onTick(Tick t) {
+    private List<EngineOutput> onTick(Tick t) {
         if (t.tickSeq() <= lastTickSeq) {
             throw new IllegalStateException("tick " + t.tickSeq() + " after " + lastTickSeq + ": ticks must be strictly increasing");
         }
@@ -196,7 +207,7 @@ public final class ShardState {
         }
         rollingRebuildAndCheck(t.tickSeq());
 
-        List<MarginEvent> events = new ArrayList<>();
+        List<EngineOutput> events = new ArrayList<>();
         if (affected != null) {
             for (Account a : affected.values()) {
                 if (!fullyPriced(a)) continue;
@@ -247,7 +258,74 @@ public final class ShardState {
             h.avgPrice = now.avgPrice().doubleValue();
         }
         a.cash = a.cash.add(o.cashDelta());
+        PendingOrder p = a.pending.get(f.orderId());
+        if (p != null && p.instrumentId().equals(i.id())) {
+            // This fill belongs to an accepted order: release that much of its reservation.
+            long left = PreTradeCheck.remainingAfterFill(p.remaining(), f.qty());
+            if (left == 0) a.pending.remove(f.orderId());
+            else a.pending.put(f.orderId(), new PendingOrder(p.instrumentId(), left));
+        }
         if (fullyPriced(a)) a.latest = margin(a);
+    }
+
+    // ---------------------------------------------------------------- pre-trade check
+
+    /**
+     * The pre-trade margin check. It needs no lock: this order sits in the account's partition, in line
+     * with that account's fills and with every tick, and this thread is the only one that ever touches the
+     * account. Whatever the shard has applied so far IS the account's state at this point in the log.
+     *
+     * <p>A bad order must never stop the shard, so everything a user could get wrong is a rejection, not
+     * an exception.
+     */
+    private List<EngineOutput> onOrder(OrderRequest o) {
+        if (o.origin() != OrderRequest.Origin.USER) return List.of(); // the engine's own square-off orders: M5
+        if (!seenOrderIds.add(o.orderId())) {
+            duplicateOrders++; // the same request written twice (an API retry): decided once
+            return List.of();
+        }
+        Account a = accounts.get(o.accountId());
+        if (a == null) return List.of(OrderDecision.rejected(o, OrderDecision.Reason.UNKNOWN_ACCOUNT, lastTickSeq));
+        Instrument i = instruments.get(o.instrumentId());
+        OrderDecision.Reason bad = PreTradeCheck.structuralReject(i, cfg, o);
+        if (bad != null) return List.of(OrderDecision.rejected(o, bad, lastTickSeq));
+        if (!markets.containsKey(i.underlying()) || !fullyPriced(a)) {
+            return List.of(OrderDecision.rejected(o, OrderDecision.Reason.NO_MARKET, lastTickSeq));
+        }
+        long qty = PreTradeCheck.signedQty(o);
+        MarginResult before = whatIf(a, null, 0);
+        MarginResult after = whatIf(a, i.id(), qty);
+        boolean ok = PreTradeCheck.passes(before, after, cfg.thresholds());
+        if (ok) a.pending.put(o.orderId(), new PendingOrder(i.id(), qty));
+        return List.of(OrderDecision.checked(o, ok, lastTickSeq, after));
+    }
+
+    /**
+     * Margin if every reserved order (plus one extra, if given) filled now at the mark. Works on copies of
+     * the account's vectors: the same remove-old / add-new steps a real fill takes, without touching state.
+     */
+    private MarginResult whatIf(Account a, String extraInstrumentId, long extraQty) {
+        TreeMap<String, AccountVector> vectors = new TreeMap<>();
+        for (AccountVector v : a.vectors.values()) vectors.put(v.underlying(), v.copy());
+        BigDecimal cash = a.cash;
+        for (var d : PreTradeCheck.netDeltas(a.pending.values(), extraInstrumentId, extraQty).entrySet()) {
+            if (d.getValue() == 0) continue;
+            Instrument i = instruments.get(d.getKey());
+            String u = i.underlying();
+            RiskArray array = arrays.get(i.id()); // present if anyone in the shard holds it
+            if (array == null) array = RiskArray.compute(i, markets.get(u), grids.get(u), cfg.riskFreeRate());
+            Position old = a.positions.getOrDefault(i.id(), Position.FLAT);
+            PositionAccounting.Outcome o = PositionAccounting.apply(i.type(), old, d.getValue(), PreTradeCheck.mark(array.price()));
+            AccountVector v = vectors.get(u);
+            if (v == null) {
+                v = new AccountVector(u);
+                vectors.put(u, v);
+            }
+            if (old.qty() != 0) v.remove(old.qty(), old.avgPrice().doubleValue(), array);
+            if (o.position().qty() != 0) v.add(o.position().qty(), o.position().avgPrice().doubleValue(), array);
+            cash = cash.add(o.cashDelta());
+        }
+        return MarginCalculator.compute(vectors.values(), cfg, cash.doubleValue(), a.collateral.doubleValue());
     }
 
     // ---------------------------------------------------------------- indexes
@@ -363,6 +441,8 @@ public final class ShardState {
                 h.str(v.underlying());
                 for (double c : v.components()) h.dbl(c);
             }
+            h.num(a.pending.size());
+            for (var e : a.pending.entrySet()) h.str(e.getKey()).str(e.getValue().instrumentId()).num(e.getValue().remaining());
             h.num(a.tracker.level().ordinal()).num(a.tracker.callStreak()).num(a.tracker.squareOffStreak());
             MarginResult r = a.latest;
             h.num(r == null ? 0 : 1);
@@ -374,6 +454,8 @@ public final class ShardState {
         }
         h.num(seenFillIds.size());
         for (String id : seenFillIds) h.str(id);
+        h.num(seenOrderIds.size());
+        for (String id : seenOrderIds) h.str(id);
         return h.hex();
     }
 
@@ -484,5 +566,18 @@ public final class ShardState {
 
     public long duplicateFills() {
         return duplicateFills;
+    }
+
+    public long duplicateOrders() {
+        return duplicateOrders;
+    }
+
+    /** Accepted orders still waiting for fills, by order id. */
+    public SortedMap<String, PendingOrder> pendingOrders(String accountId) {
+        return new TreeMap<>(accounts.get(accountId).pending);
+    }
+
+    public boolean owns(String accountId) {
+        return accounts.containsKey(accountId);
     }
 }
