@@ -22,21 +22,20 @@ actual=$(psql -c "select string_agg(table_name, ' ' order by table_name) from in
 [ "$actual" = "$expected" ] || fail "tables: got [$actual]"
 pass "all tables present"
 
-if psql -c "begin; insert into ledger_entries (txn_id, ledger_account, amount, reason, log_time)
-            values ('gate-unbalanced', 'CASH', 100, 'GATE', now()); commit;" >/dev/null 2>&1; then
-  fail "unbalanced ledger txn was accepted"
-fi
+# Negative checks must fail for the *right* reason, or a typo'd column would look like a pass.
+out=$(psql -c "begin; insert into ledger_entries (txn_id, account, amount, reason, log_time)
+               values ('gate-unbalanced', 'CASH', 100, 'GATE', now()); commit;" 2>&1 || true)
+echo "$out" | grep -q 'does not balance' || fail "unbalanced ledger txn was not rejected by the balance rule: $out"
 psql -c "begin;
-         insert into ledger_entries (txn_id, ledger_account, amount, reason, log_time) values
+         insert into ledger_entries (txn_id, account, amount, reason, log_time) values
            ('gate-balanced', 'CASH', 100, 'GATE', now()), ('gate-balanced', 'BROKER_CLEARING', -100, 'GATE', now());
          commit;
          delete from ledger_entries where txn_id = 'gate-balanced';" >/dev/null
 pass "ledger rejects unbalanced txn, accepts balanced one"
 
 psql -c "insert into audit_log (actor, action, log_time, details) values ('gate', 'GATE', now(), '{}');" >/dev/null
-if psql -c "update audit_log set action = 'X' where actor = 'gate';" >/dev/null 2>&1; then
-  fail "audit_log accepted an UPDATE"
-fi
+out=$(psql -c "update audit_log set action = 'X' where actor = 'gate';" 2>&1 || true)
+echo "$out" | grep -q 'append-only' || fail "audit_log UPDATE was not blocked by the append-only rule: $out"
 pass "audit_log is append-only"
 
 echo "== topics"

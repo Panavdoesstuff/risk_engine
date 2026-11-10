@@ -66,7 +66,7 @@ Start `docs/decisions.md` on day one. Write one short entry every time you choos
 - [x] Flyway migrations for all tables in the v2 data model (`accounts` … `engine_snapshots`, including `outbox` and `audit_log`)
 - [x] Create topic `engine-events` with N partitions (start N = 4) and topic `engine-out`
 - [x] Instrument loader from NSE F&O bhavcopy, with lot sizes valid on the replay date
-- [ ] Load Nifty and Bank Nifty minute bars and India VIX (intraday if available, else daily) into local files *(loader done; needs the raw data files, see `data/README.md`)*
+- [ ] Load Nifty minute bars and India VIX (intraday if available, else daily) into local files *(loader done; needs the raw data files, see `data/README.md`)*
 - [x] Seeded account generator: futures-only, option buyers, short straddles/strangles, hedged spreads; some short sellers thinly funded
 - [x] **Start-of-day state:** generator opens positions priced at the previous trading day's close (3 June 2024 for the replay), so the crash day starts from a believable book
 
@@ -74,16 +74,19 @@ Start `docs/decisions.md` on day one. Write one short entry every time you choos
 
 ### M2 — Pricing and margin (single-threaded, no Kafka yet)
 
-- [ ] `BlackScholes`: call, put, futures price; normal CDF implementation you can explain
-- [ ] Greeks: delta, gamma, vega, theta
-- [ ] Volatility inputs: Nifty = VIX ÷ 100; Bank Nifty = Nifty vol × calibrated ratio (compute ratio from trailing realised vol, store in config)
-- [ ] `ScenarioGrid`: 16 scenarios; price scan range per underlying in config; extreme multiple and coverage fraction from NSE Clearing parameters, in config
-- [ ] `RiskArray` per instrument, `AccountVector` per account
-- [ ] Margin = max(short-option minimum, worst scenario loss) + exposure margin
-- [ ] Long options: loss capped at premium; available margin includes net option value
-- [ ] Utilisation and status thresholds (80 / 100 / 120%, N ticks) in config
-- [ ] Tests: JUnit textbook prices; jqwik properties (parity holds, margin ≥ 0, adding a hedge never raises margin)
-- [ ] Write a hand-worked short straddle example in `docs/` and assert the engine matches it
+> **Changes from the original plan** (agreed at M2 start): engine input goes through an `EventLog` interface (in-memory + file; Redpanda in M4), and **Nifty only until the end of M5**. One deviation, explained in decisions.md #23: net option value is subtracted from the requirement (NSE's form) rather than added to available margin.
+
+- [x] `BlackScholes`: call, put, futures price; normal CDF implementation you can explain
+- [x] Greeks: delta, gamma, vega, theta
+- [x] Volatility inputs: Nifty = VIX ÷ 100 *(Bank Nifty ratio deferred until after M5)*
+- [x] `ScenarioGrid`: 16 scenarios; price scan range per underlying in config; extreme multiple and coverage fraction from NSE Clearing parameters, in config *(values are guesses until checked)*
+- [x] `RiskArray` per instrument, `AccountVector` per account
+- [x] Margin = max(short-option minimum, worst scenario loss) + exposure margin
+- [x] Long options: loss capped at premium; available margin includes net option value *(see note above)*
+- [x] Utilisation and status thresholds (80 / 100 / 120%, N ticks) in config
+- [x] Tests: JUnit textbook prices; jqwik properties (parity holds, margin ≥ 0, adding a hedge never raises margin)
+- [x] Write a hand-worked short straddle example in `docs/` and assert the engine matches it
+- [x] `EventLog` interface + in-memory and file implementations; single-threaded `ReferenceMarginEngine` reading from it
 
 **Gate:** all pricing and margin tests green; hand example matches to the rupee.
 

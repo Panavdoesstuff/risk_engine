@@ -28,7 +28,7 @@ public final class Cli {
             usage: replayer <command> [--flag value ...]
 
               instruments  --bhavcopy FILE --date YYYY-MM-DD --out FILE
-                           [--lots fo_mktlots.csv] [--symbols NIFTY,BANKNIFTY]
+                           [--lots fo_mktlots.csv] [--symbols NIFTY]
                   Normalise an NSE F&O bhavcopy. Legacy-format bhavcopies need --lots.
 
               bars         --in FILE --out FILE [--from YYYY-MM-DD] [--to YYYY-MM-DD]
@@ -62,7 +62,7 @@ public final class Cli {
     }
 
     private static void instruments(Map<String, String> f) {
-        Set<String> symbols = new LinkedHashSet<>(List.of(f.getOrDefault("symbols", "NIFTY,BANKNIFTY").split(",")));
+        Set<String> symbols = new LinkedHashSet<>(List.of(f.getOrDefault("symbols", "NIFTY").split(",")));
         LotSizeTable lots = f.containsKey("lots") ? LotSizeTable.parseMktLots(Path.of(f.get("lots"))) : null;
         List<Instrument> out = InstrumentLoader.load(Path.of(req(f, "bhavcopy")), lots, symbols,
                 LocalDate.parse(req(f, "date")));

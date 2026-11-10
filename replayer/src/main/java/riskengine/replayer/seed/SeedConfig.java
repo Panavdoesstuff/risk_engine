@@ -37,9 +37,9 @@ public record SeedConfig(
         mix.put(Archetype.SHORT_STRADDLE, 15);
         mix.put(Archetype.SHORT_STRANGLE, 15);
         mix.put(Archetype.HEDGED_SPREAD, 25);
+        // Nifty only until the end of M5 (docs/decisions.md, M2). Pass explicit weights to add Bank Nifty.
         SortedMap<String, Integer> und = new TreeMap<>();
-        und.put("NIFTY", 70);
-        und.put("BANKNIFTY", 30);
+        und.put("NIFTY", 100);
         return new SeedConfig(seed, accounts, asOf, new BigDecimal("0.12"), 2_500, mix, und);
     }
 }

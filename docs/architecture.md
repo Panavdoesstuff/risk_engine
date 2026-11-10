@@ -1,6 +1,6 @@
 # Architecture
 
-*Filled in as milestones land. Current state: M1.*
+*Filled in as milestones land. Current state: M2.*
 
 ```
 replayer ──ticks (every partition, global tick_seq)──▶ engine-events[0..N-1] ──▶ ShardRunner × N
@@ -23,3 +23,21 @@ NSE F&O bhavcopy (3 Jun 2024) + fo_mktlots.csv ──replayer instruments──�
 instruments-2024-06-03.csv + seed ──replayer seed──▶ accounts.csv, positions.csv, book.meta
 Nifty / Bank Nifty minute bars, India VIX ──replayer bars──▶ normalised ts,open,high,low,close (+ .meta)
 ```
+
+## Margin model (M2)
+
+```
+Tick (spot, VIX) ──▶ MarketState ──▶ RiskArray per instrument (price + 16 scenario losses per unit)
+                                           │  × qty, summed
+                                           ▼
+                                     AccountVector (16 losses, net option value, short/exposure notional)
+                                           │
+                                           ▼
+                     MarginCalculator: required = max(0, max(SOMC, worst loss) − NOV) + exposure
+                                       utilisation = required / (cash + collateral)
+                                           │
+                                           ▼
+                     MarginStatusTracker: OK / WARNING / MARGIN_CALL / SQUARE_OFF (3-tick confirmation)
+```
+
+`ReferenceMarginEngine` drives this from an `EventLog`, recomputing every account on every tick. It is the correctness reference for M3's incremental shards.

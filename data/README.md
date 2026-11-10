@@ -9,7 +9,7 @@ Nothing in `data/raw/`, `data/processed/` or `data/seed/` is committed. Everythi
 | `fo03JUN2024bhav.csv` | Instruments + 3 June closing prices | NSE archives, F&O bhavcopy for 03-Jun-2024 (legacy format; zipped). |
 | `fo_mktlots.csv` **as of June 2024** | Lot sizes per expiry month | NSE publishes only the *current* file. Get a June 2024 copy (e.g. from a web archive snapshot) or check NSE lot-size circulars. Lot sizes changed during 2024; do not use today's file. |
 | Nifty 50 1-minute bars, 3–4 June 2024 | Replay ticks | NSE does not publish free historical minute bars. Broker historical-candle APIs or a public dataset; note the source in `docs/decisions.md`. |
-| Bank Nifty 1-minute bars, same days | Replay ticks | As above. |
+| Bank Nifty 1-minute bars, same days | *Not needed until after M5* (Nifty only until then) | As above. |
 | India VIX (minute if you can, else daily) | Volatility input | Daily: NSE India VIX historical download. Minute: broker API. The loader records which one you used. |
 
 If you can get the UDiFF-format bhavcopy for the date instead, it carries lot sizes itself (`NewBrdLotQty`) and `--lots` becomes an optional cross-check.
@@ -26,7 +26,6 @@ $R instruments --bhavcopy data/raw/fo03JUN2024bhav.csv --lots data/raw/fo_mktlot
                --date 2024-06-03 --out data/processed/instruments-2024-06-03.csv
 
 $R bars --in data/raw/<nifty-file>.csv     --from 2024-06-03 --to 2024-06-04 --out data/processed/NIFTY-1m.csv
-$R bars --in data/raw/<banknifty-file>.csv --from 2024-06-03 --to 2024-06-04 --out data/processed/BANKNIFTY-1m.csv
 $R bars --in data/raw/<vix-file>.csv       --from 2024-05-01 --to 2024-06-04 --out data/processed/INDIAVIX.csv
 
 $R seed --instruments data/processed/instruments-2024-06-03.csv --out data/seed --seed 42 --accounts 1000

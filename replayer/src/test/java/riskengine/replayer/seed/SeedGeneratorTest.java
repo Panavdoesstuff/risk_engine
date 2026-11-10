@@ -135,7 +135,15 @@ class SeedGeneratorTest {
         long thinNaked = b.accounts().stream().filter(a -> a.archetype().sellsNakedRisk() && a.thinFunded()).count();
         double share = (double) thinNaked / naked;
         assertTrue(share > 0.20 && share < 0.30, "about 25% of naked sellers are thin: " + share);
-        assertEquals(List.of("BANKNIFTY", "NIFTY"), b.underlyings());
+        assertEquals(List.of("NIFTY"), b.underlyings(), "Nifty only by default until M5");
+    }
+
+    @Test
+    void bankNiftyStillWorksWhenAskedFor() {
+        var d = SeedConfig.defaults(42, 500, AS_OF);
+        var both = new java.util.TreeMap<>(Map.of("NIFTY", 70, "BANKNIFTY", 30));
+        var cfg = new SeedConfig(d.seed(), d.accounts(), d.asOf(), d.proxyMarginRate(), d.thinFundedBp(), d.archetypeWeights(), both);
+        assertEquals(List.of("BANKNIFTY", "NIFTY"), SeedGenerator.generate(universe(), cfg).underlyings());
     }
 
     @Test
