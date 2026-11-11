@@ -16,6 +16,7 @@ COPY replayer replayer
 COPY api api
 COPY loadtest loadtest
 COPY broker-mock broker-mock
+COPY report report
 RUN ./gradlew --no-daemon :host:installDist :writers:installDist :replayer:installDist :broker-mock:installDist :api:bootJar -x test
 
 FROM eclipse-temurin:21-jre

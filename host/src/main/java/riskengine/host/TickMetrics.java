@@ -7,9 +7,16 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.function.LongConsumer;
 import riskengine.events.LoggedEvent;
 import riskengine.events.Tick;
+import riskengine.margin.EngineOutput;
+import riskengine.margin.EpisodeChange;
+import riskengine.margin.MarginEvent;
+import riskengine.margin.MarginLevel;
+import riskengine.margin.SquareOffLeg;
 
 /**
- * Throughput and tick-to-margin latency per shard, in the Prometheus text format.
+ * Throughput and tick-to-margin latency per shard, in the Prometheus text format. Also what the shards are
+ * saying (margin alerts, square-offs, legs) and the latest market tick, so a dashboard can show a replay's
+ * alerts firing next to the market that caused them.
  *
  * <p><b>Tick-to-margin</b> is measured from the moment the tick was handed to the producer (the record's
  * timestamp in the partition) to the moment the shard has applied it: every holder repriced, every
@@ -44,6 +51,12 @@ public final class TickMetrics {
     private final boolean[] active;
     private final LongAdder[] snapshots, snapshotNanos;
     private final java.util.concurrent.atomic.AtomicLongArray snapshotBytes;
+    /** Escalations into WARNING, MARGIN_CALL, SQUARE_OFF; square-off episodes opened, resolved, exhausted; legs. */
+    private final LongAdder[][] alerts;
+    private final LongAdder[][] episodes;
+    private final LongAdder[] legs;
+    /** The latest tick seen by any shard (every tick goes to every partition). */
+    private volatile Tick lastTick;
 
     public TickMetrics(int shards, Source source) {
         this.shards = shards;
@@ -58,6 +71,13 @@ public final class TickMetrics {
         snapshotNanos = adders(shards);
         snapshotBytes = new java.util.concurrent.atomic.AtomicLongArray(shards);
         active = new boolean[shards];
+        alerts = new LongAdder[shards][];
+        episodes = new LongAdder[shards][];
+        for (int i = 0; i < shards; i++) {
+            alerts[i] = adders(LEVELS.length);
+            episodes[i] = adders(EPISODES.length);
+        }
+        legs = adders(shards);
         for (LongAdder[] b : buckets) for (int i = 0; i < b.length; i++) b[i] = new LongAdder();
     }
 
@@ -108,10 +128,30 @@ public final class TickMetrics {
         listeners = now;
     }
 
+    private static final MarginLevel[] LEVELS = {MarginLevel.WARNING, MarginLevel.MARGIN_CALL, MarginLevel.SQUARE_OFF};
+    private static final EpisodeChange.State[] EPISODES = EpisodeChange.State.values();
+
+    /**
+     * Called on shard {@code shard}'s thread for each output, as it is handed to the publisher. After a
+     * restart the outputs replayed from the snapshot offset are counted again (they are published again too).
+     */
+    void output(int shard, EngineOutput o) {
+        switch (o) {
+            case MarginEvent m -> {
+                if (m.to().compareTo(m.from()) > 0 && m.to() != MarginLevel.OK) alerts[shard][m.to().ordinal() - 1].increment();
+            }
+            case EpisodeChange c -> episodes[shard][c.state().ordinal()].increment();
+            case SquareOffLeg l -> legs[shard].increment();
+            default -> { }
+        }
+    }
+
     /** Called on shard {@code shard}'s thread after it applied {@code e}. */
     void applied(int shard, LoggedEvent e) {
         events[shard].increment();
-        if (!(e.event() instanceof Tick)) return;
+        if (!(e.event() instanceof Tick tick)) return;
+        Tick last = lastTick;
+        if (last == null || tick.tickSeq() > last.tickSeq()) lastTick = tick;
         ticks[shard].increment();
         long nanos = source.sinceSentNanos(shard, e);
         if (nanos == Source.UNKNOWN) return;
@@ -159,6 +199,31 @@ public final class TickMetrics {
         counter(sb, "risk_snapshots_total", "Snapshots the shard has taken.", snapshots);
         sb.append("# HELP risk_snapshot_bytes Size of the shard's last snapshot.\n# TYPE risk_snapshot_bytes gauge\n");
         for (int s = 0; s < shards; s++) if (active[s]) sb.append("risk_snapshot_bytes{shard=\"").append(s).append("\"} ").append(snapshotBytes.get(s)).append('\n');
+        // What the shards are saying.
+        sb.append("# HELP risk_margin_alerts_total Accounts escalated into a margin level (WARNING, MARGIN_CALL, SQUARE_OFF).\n# TYPE risk_margin_alerts_total counter\n");
+        for (int s = 0; s < shards; s++) {
+            if (!active[s]) continue;
+            for (int i = 0; i < LEVELS.length; i++) {
+                sb.append("risk_margin_alerts_total{shard=\"").append(s).append("\",level=\"").append(LEVELS[i]).append("\"} ").append(alerts[s][i].sum()).append('\n');
+            }
+        }
+        sb.append("# HELP risk_square_off_episodes_total Square-off episodes by what happened (OPENED, RESOLVED, EXHAUSTED).\n# TYPE risk_square_off_episodes_total counter\n");
+        for (int s = 0; s < shards; s++) {
+            if (!active[s]) continue;
+            for (EpisodeChange.State st : EPISODES) {
+                sb.append("risk_square_off_episodes_total{shard=\"").append(s).append("\",state=\"").append(st).append("\"} ").append(episodes[s][st.ordinal()].sum()).append('\n');
+            }
+        }
+        counter(sb, "risk_square_off_legs_total", "Square-off legs planned and published.", legs);
+        Tick t = lastTick;
+        if (t != null) {
+            sb.append("# HELP risk_market_spot Spot of the latest tick applied.\n# TYPE risk_market_spot gauge\n");
+            sb.append("risk_market_spot{underlying=\"").append(t.underlying()).append("\"} ").append(t.spot().toPlainString()).append('\n');
+            sb.append("# HELP risk_market_vix Volatility index of the latest tick applied.\n# TYPE risk_market_vix gauge\n");
+            sb.append("risk_market_vix{underlying=\"").append(t.underlying()).append("\"} ").append(t.vix().toPlainString()).append('\n');
+            sb.append("# HELP risk_market_log_time_seconds Log time of the latest tick applied: the replay's clock.\n# TYPE risk_market_log_time_seconds gauge\n");
+            sb.append("risk_market_log_time_seconds ").append(t.logTimeMillis() / 1000).append('\n');
+        }
         // The JVM, for reading latency spikes against GC.
         long gcCount = 0, gcMillis = 0;
         List<GarbageCollectorMXBean> gcs = ManagementFactory.getGarbageCollectorMXBeans();

@@ -1,6 +1,6 @@
 # Architecture
 
-*Filled in as milestones land. Current state: M6 part 1 (scale and metrics). Snapshots and recovery are M6 part 2.*
+*Filled in as milestones land. Current state: M7 (crash-day replay). The README has the overview diagram.*
 
 ```
 replayer ──ticks (every partition, global tick_seq)──▶ engine-events[0..N-1] ──▶ ShardRunner × N
@@ -19,9 +19,9 @@ broker-mock ──Fill callbacks (account's partition)────────�
 ## Offline data pipeline (M1)
 
 ```
-NSE F&O bhavcopy (3 Jun 2024) + fo_mktlots.csv ──replayer instruments──▶ instruments-2024-06-03.csv
+NSE F&O bhavcopy (3 Jun 2024) + lot sizes (data/reference) ──replayer instruments──▶ instruments-2024-06-03.csv
 instruments-2024-06-03.csv + seed ──replayer seed──▶ accounts.csv, positions.csv, book.meta
-Nifty / Bank Nifty minute bars, India VIX ──replayer bars──▶ normalised ts,open,high,low,close (+ .meta)
+Nifty minute bars, India VIX minute bars (CSV or Upstox JSON) ──replayer bars──▶ normalised ts,open,high,low,close (+ .meta)
 ```
 
 ## Margin model (M2)
@@ -33,7 +33,7 @@ Tick (spot, VIX) ──▶ MarketState ──▶ RiskArray per instrument (price
                                      AccountVector (16 losses, net option value, short/exposure notional)
                                            │
                                            ▼
-                     MarginCalculator: required = max(0, max(SOMC, worst loss) − NOV) + exposure
+                     MarginCalculator: required = max(0, max(SOMC, worst loss) − NOV) + exposure   (SOMC = 0 since M7: NSE has none for index options)
                                        utilisation = required / (cash + collateral + futures MTM)
                                            │
                                            ▼

@@ -11,7 +11,24 @@ Fill in as you go. Every number names the commit and command that produced it.
 | Mismatches over 1M events | **0** (in-memory logs, and again through Redpanda; details below) | M4 harness |
 | Duplicate closes under chaos | **0** legs closed twice, 0 surplus legs, 0 unbalanced ledger transactions (details below) | M5 chaos gate |
 | Recovery hash match | **4 of 4 shards identical** after 6 kills -9 under chaos; 0 duplicate broker orders | M6 kill test |
-| Crash day: warned / called / squared off | | M7 report |
+| Crash day, 4 June 2024, 100k accounts: warned / margin-called / squared off | **23,662 / 13,350 / 8,710** (9,077 legs); first square-off 09:24, last ended 12:28; 0 accounts below zero equity | M7 crash-day report |
+
+## M7: the crash day
+
+`./gradlew :report:crashDay` on branch `m7`: 4 June 2024 replayed minute by minute (375 ticks, real NSE and Upstox data, minute VIX) against 100,000 seeded accounts opened at the 3 June close, with the margin parameters checked against NSE Clearing's rules (decision 115). The production shard code, 4 shards in one process; every square-off leg filled at the engine's mark before the next tick (decision 117). Full write-up, chart, five worst accounts and the minute-by-minute curve: [crash-day-2024-06-04.md](crash-day-2024-06-04.md).
+
+| | |
+| --- | --- |
+| Warned (80%) / margin-called (100%, 3 ticks) / squared off (120%, 3 ticks) | 23,662 / 13,350 / 8,710 accounts |
+| Square-off episodes / legs / lots | 9,060 / 9,077 / 19,377; all resolved, 0 exhausted |
+| Who was squared off | every thinly funded short straddle and strangle (7,493), 1,217 futures accounts; no option buyer or hedged spread |
+| First square-off started / last episode ended (log time) | 09:24 / 12:28 IST: **3 h 04 min** |
+| Busiest minute | 10:58 IST: 782 square-offs |
+| Accounts below zero equity | 0 at every minute |
+| Shard compute per tick, slowest shard (no broker hop) | median 4.7 ms, p99 17 ms; busiest minute 5.4 ms + 0.65 ms for its fills |
+| Two runs | identical state hashes on all 4 shards, identical counts minute by minute |
+
+These numbers describe this engine on a synthetic book on that day, not Indian traders on that day. The limits are listed in the report.
 
 ## M3: incremental vs full, per tick
 
@@ -78,7 +95,9 @@ Part 1's 100 ticks/s figure (p99 19.7 ms) came from 60-second windows. In two-mi
 | 100 users, about 10/s each (at the limit) | 968 | 3.6 ms | 131 ms | 893 ms | 0% |
 | 20 users, 50/s each (5× the limit) | 994 | 0.32 ms (all) / 2.6 ms (202s) | 2.7 ms / 4.8 ms | 18 ms / 723 ms | 79.4% |
 
-With users at the limit, k6 dropped 1,935 requests because all 600 of its virtual users were waiting on slow responses. Accepted orders have a heavy tail (p99 0.7–0.9 s). The likely cause is the synchronous `acks=all` write per request to a single-core Redpanda on the same laptop, but I haven't profiled it.
+With users at the limit, k6 dropped 1,935 requests because all 600 of its virtual users were waiting on slow responses. Accepted orders have a heavy tail (p99 0.7–0.9 s).
+
+**Profiled in M7 (decision 119):** the tail is the PENDING row's commit waiting for Postgres to flush its write-ahead log to the Docker VM's disk, not Redpanda. Per 10-second window under this load, the insert's p99 was 92–435 ms, while Redis stayed under 1 ms and the Redpanda write at 1–2 ms. With asynchronous commit for the API's connections, the endpoint's p99 fell from 441 ms to 103 ms (p90 55 → 2.2 ms). That trades durability, so it is not applied; the options are in decision 119.
 
 ### Tests
 

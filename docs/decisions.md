@@ -526,3 +526,89 @@ Each id is stamped, when first seen, with the latest tick's log time (before any
 - *Effect:* the sets, and so snapshot sizes, stop growing with history; they hold about two days of ids.
 - *Cost:* a duplicate that arrives more than two days after the original is applied again. Broker duplicates arrive within seconds and API retries within minutes, so two days leaves a wide margin. Postgres keeps its own unique constraints (`fills.broker_fill_id`, the outbox key) with no window, so a very late duplicate fill would be refused there even though the shard would apply it.
 - *Tested:* inside the window a duplicate is ignored; just past it the id is forgotten and a repeat is applied, at the same tick in both engines; pruning is exact at the cutoff; five days of hourly ticks keep about two days of ids, with every in-window duplicate still caught and replays agreeing; a restored shard forgets on the same tick as the original.
+
+## M7: crash day and polish
+
+**112. The fill ingester refuses a fill already booked in Postgres: 422, audited, never written to the log.** *(Your call after the M6 follow-ups.)*
+Before writing a fill, the ingester looks its broker fill id up in `fills`. If it is there, the fill has been applied by its shard and booked by the writers, so the callback is refused with 422 and an audit row (`CALLBACK_REFUSED`, reason `fill already booked`). This closes the gap decision 111 left: a duplicate arriving more than two days late would have been applied by the shard (which has forgotten the id) and refused by Postgres (which never forgets), leaving the two disagreeing.
+- *A duplicate that arrives before the first copy is booked still goes through,* and the shard drops it (decision 111). Both paths are needed: the writers book a fill a few milliseconds after the shard applies it, so the shard is the only place a near-simultaneous repeat can be caught.
+- *Counted apart:* `alreadyBooked()` is not added to `refused()`, which still means "did not match an order we placed".
+- *The mock broker changed so both paths are tested:* half of its duplicate callbacks now arrive at the same moment as the original, half 2 s later. Before, all came 20 ms later, and once the ingester checked `fills` every one of them was refused there and the shard's own dedupe was no longer exercised. The chaos gate now requires both: in the last run, of 90 duplicates 41 were dropped by shards and 49 refused as already booked.
+- *Tested* in the chaos test: an already-booked fill is answered 422, nothing reaches the log, the refusal is in `audit_log`, and every duplicate the broker sent was stopped by one or the other.
+- *Cost:* one indexed lookup per fill callback.
+
+**113. Market data: Upstox one-minute candles, read directly; India VIX is minute data, joined "as of".** *(Your call at M7 start.)*
+`replayer bars` now also reads an Upstox v3 historical-candle response (`.json`: `{"status":"success","data":{"candles":[[time, open, high, low, close, volume, oi], …]}}`, newest first) and writes the usual `ts,open,high,low,close` file, oldest first. Anything not exactly that shape is refused, not skipped. Volume and open interest are dropped (zero for an index).
+- *Minute VIX instead of daily.* The VIX file is the same one-minute format, so a tick takes the latest VIX bar that had *closed* (a bar starting 09:15 is known at 09:16). The tick builder already did this (decision 43); nothing changed there. With daily VIX every tick on 4 June would have used 3 June's close (about 21) all day, while VIX actually reached 31.7. With minute VIX, scenario volatility rises during the day as it did.
+- *Checked:* 375 bars a day for both series, no gaps, no bars outside the session.
+- *Source noted:* Upstox is a broker's historical API, not NSE. Its open, low and VIX high for 4 June match NSE's published figures (decision 116).
+
+**114. Lot sizes: a small sourced file, because no `fo_mktlots.csv` from April–July 2024 is archived.**
+`data/reference/nifty_lots_2024-06-03.csv` (committed, unlike `data/raw/`) is in `fo_mktlots.csv`'s layout, so the existing loader reads it unchanged. Its header rows cite the source: NSE circular **NSE/FAOP/61415 (37/2024), 2 April 2024**, which cut the Nifty lot from 50 to 25 for every contract trading from 26 April 2024 (first monthly expiry with the new lot: 30 May 2024). The next revision (to 75) took effect on 20 November 2024, so every contract listed on 3–4 June 2024 is 25.
+- *Cross-checked against the bhavcopy itself:* all 1,530 Nifty open-interest figures on 3 June are multiples of 25 and 453 are not multiples of 50; futures traded value ÷ contracts ÷ price gives 24.9 units per contract.
+- It covers every Nifty expiry month in the 3 June bhavcopy (June 2024 to December 2028). The loader still fails loudly on a month the file lacks.
+
+**115. Margin parameters checked against NSE Clearing's published rules. Two values changed.**
+The day's SPAN parameter file (`nsccl.20240603.s.spn`) could not be fetched: NSE's archive refuses scripted downloads and the Wayback Machine has no copy. So the values were checked against the published framework instead: **NSE Clearing circular NCL/CMPT/44391 (072/2020), effective 1 June 2020**, still the framework in June 2024, and NSE's SPAN page for the scenario set.
+
+| Parameter | Was | Now | Status | Rule |
+| --- | --- | --- | --- | --- |
+| Price scan range | 9% | **9.3%** | VERIFIED (floor) | 6σ × √2, at least 9.3% for index derivatives |
+| Volatility scan range | 4 vol points | 4 | VERIFIED (floor) | 25% of EWMA volatility, at least 4% |
+| Extreme moves | 2 × range, 35% | same | VERIFIED | SPAN scenarios 15–16 |
+| Short option minimum | 3% | **0** | VERIFIED | abolished for index derivatives from 1 June 2020 |
+| Exposure (extreme loss) margin | 2% | 2% | VERIFIED | 2% of notional for index derivatives |
+| Risk-free rate, dividend yield | 6.9%, 1.2% | same | GUESS | not NSE Clearing parameters |
+| Volatility = VIX ÷ 100 | | same | GUESS | a model choice; SPAN carries a volatility per contract |
+| Thresholds 80/100/120%, 3 ticks | | same | GUESS | a broker's policy, not NSE's |
+
+- *"Floor":* both scan ranges are "statistical, at least X". The statistical part almost certainly sat below the floor: Nifty's realised daily volatility before the election was under 1%, which makes 6σ × √2 under 8.5%, below 9.3%; and 25% of a 12–15% annual volatility is 3–3.75 points, below 4. Without the day's file this is an argument, not a check, so they are marked "VERIFIED (floor)".
+- *Short option minimum, 3% → 0:* decision 25 already doubted it. With it gone, hedged spreads no longer pay a charge on their short leg that the long leg should offset, which is what made them look expensive.
+- *Known rules not modelled:* a 17.7% price scan for index options more than nine months out; 3% exposure margin for options more than 10% out of the money and 5% beyond nine months; the 1.75% calendar spread charge (decision 26). They are listed as limits in the README and the crash-day report.
+- *Effect:* the margin config fingerprint changed, so the seed was regenerated (cash is sized with the margin engine, decision 30), and snapshots taken with the old config are refused (decision 101), as designed.
+
+**116. What was checked against published figures, and how.**
+NSE's own historical download refuses scripted access, and getting round that would mean imitating a browser to pass its bot check, which I did not do. The 4 June figures were checked against press reports of NSE data instead:
+- Nifty 50: open 23,179.50, low 21,281.45 (12:29), close 21,884.50 (−5.93%, −1,379.40). The minute bars match the open and the low exactly. The last bar's close (21,996.45) is not the official close, which NSE computes as a weighted average of the last 30 minutes. The replay never uses the official close.
+- India VIX: 4 June high 31.71, matching the bars. The 3 June close was reported down 14.9% from 24.60, which is about 20.9; 4 June's first VIX bar opens at 20.94. **The seed uses 20.94** for 3 June's close, not the last minute bar's 21.13.
+- *Not checked:* the official India VIX close for 4 June (sources say 26.7–26.75) and the 3 June Nifty close (23,263.90, derived from the 4 June close and change). Neither is used by the replay.
+- The seed's start spot is still implied from the June future's settlement (decision 30), 23,320.33, about 56 points above the official 3 June close. The report says so.
+
+**117. The crash-day report replays the day in-process, with a broker that fills every leg before the next tick.**
+`./gradlew :report:crashDay` (new module `report`, as in the build map's layout) runs the real `ShardState` code, one thread per partition, over the tick logs `replayer ticks` writes, against the 100,000-account seeded book. It writes `docs/crash-day-2024-06-04.md`, a 375-row minute-by-minute CSV and an SVG chart.
+- *Why not through compose:* the compose stack's timing depends on the laptop (pace, broker delays), so its counts would change from run to run. In-process the replay is deterministic: the generator runs it twice and refuses to write unless the state hashes and minute-by-minute counts agree. The demo (decision 118) shows the same day live through the whole pipeline.
+- *The broker:* each leg is filled in full at the engine's mark, at the tick's log time, and applied before the next tick. That stands for a broker filling market orders within seconds while ticks are a minute apart. It does not model slippage, rejects or a broker that falls behind. The chaos broker is the M5 gate's job.
+- *"Time to clear":* log time from the first square-off starting to the last episode ending. With this broker each account clears within its minute, so the number measures how the crash spread square-offs across the day, not the pipeline's speed. The report says so.
+- *"Worst account":* the largest margin shortfall (required − available) reached, which is how much the account would have had to add. The first version ranked by lowest equity and picked an option buyer who had spent their cash on premium, which says nothing about risk.
+- *Charts:* three panels on one time axis (Nifty, VIX, accounts margin-called and squared off), never two scales on one axis. It is an SVG with a dark-mode style, so it follows GitHub's theme.
+- *Tested:* on a 2,000-account book and a synthetic 9% fall, two runs give the same hashes and counts; per-minute counts add up to per-account counts; every episode opened is closed; no account is left squaring off at a tick.
+
+**118. The demo: one script, real data when it is there, alerts on the Grafana dashboard.**
+`scripts/demo.sh` prepares the data and the book, starts the whole compose stack as its own project (`risk-demo`, own ports and volumes, removed and recreated on each run), opens Grafana, replays 4 June at 150 ms per minute and prints what happened from Postgres. It leaves the stack running to look around.
+- *Real or synthetic:* with the 4 June files in `data/raw/` it uses them; without them (a stranger's clone: market data is not in the repo) it uses `replayer demo`'s synthetic prices and prints a banner saying so. Either way "one command, watch alerts fire" works.
+- *20,000 accounts by default* (`DEMO_ACCOUNTS`), so it is quick on a laptop; the crash-day report is the 100,000-account run.
+- *Alerts are shown in Grafana, not on a separate WebSocket page* (the build map's "minimal alerts page" is not built). The shard host now counts what the shards say, as Prometheus metrics: `risk_margin_alerts_total{level}` (escalations into WARNING, MARGIN_CALL, SQUARE_OFF), `risk_square_off_episodes_total{state}`, `risk_square_off_legs_total`, and the latest tick (`risk_market_spot`, `risk_market_vix`, `risk_market_log_time_seconds`). A new top row on the dashboard shows the replay clock in IST, Nifty, VIX, the counters, and alerts per second by level. Nifty and VIX are separate panels, not two scales on one chart.
+- *Counted where they are published,* on the shard thread, with `LongAdder`s like the other metrics. After a restart, outputs replayed from the snapshot are published and counted again: the counters say what the process has published, not distinct accounts.
+- *Grafana's minimum refresh is set to 1 s* in compose so the dashboard can refresh every 2 s during a replay.
+- *Checked:* a full run on the real data, 20,000 accounts and the chaos broker: 1,799 square-offs, all resolved; 1,979 legs filled and 46 rejected by the broker and re-planned; every ledger transaction sums to zero. The dashboard showed the replay as it ran.
+- Recording steps for the GIF: [recording-the-demo.md](recording-the-demo.md).
+
+**119. The POST /orders tail is the PENDING row's commit waiting for the disk. Not fixed: the cheap fix gives up durability.** *(Time-boxed to an hour, as asked; it took about 40 minutes.)*
+*How it was found.* Temporary timers around the three slow steps of a request (Redis replay guard, the Postgres insert of the PENDING row, the acknowledged Redpanda write), under the same k6 load as decision 99 (100 users, 1,000 orders/s, 60 s), reported per 10-second window. The instrumentation was removed afterwards.
+
+| Step, p99 per 10 s window | Under load |
+| --- | --- |
+| Redis replay guard | under 1 ms (73 ms in the first, cold window) |
+| Redpanda append, acks=all | 1–2 ms (one window 202 ms) |
+| **Postgres PENDING insert** | **92–435 ms, max 1.09 s** |
+
+- *A bigger connection pool* (8 → 32) changed little: endpoint p99 441 → 361 ms. So it is not waiting for a connection.
+- *Postgres' own wait events,* sampled 100 times during the load: almost every active API insert was waiting in `LWLock:WALWrite` (397) or `IO:WALSync` (58), that is, for the write-ahead log to be flushed to disk. Each order is its own transaction, so each waits for a flush. On Docker Desktop's VM disk one flush takes about 0.4 ms when idle (`pg_test_fsync`), and Postgres, the writers' batches and Redpanda all flush to that same disk.
+- *Confirmed* by running the API's connections with `synchronous_commit=off` (commit returns before the flush): insert p99 fell to about 0.5 ms; endpoint p50 2.1 → 0.73 ms, p90 55 → 2.2 ms, p99 441 → 103 ms (the rest is the first seconds' warm-up).
+
+*Why not ship that.* With asynchronous commit, Postgres can lose the last fraction of a second of commits if Postgres itself crashes (not if the API does). An order whose PENDING row was lost is still in the log: the shard decides it, but the writers then have no `orders` row to update, the outbox row's foreign key fails, and an accepted order would never reach the broker. Making that safe means the writers create a missing order row from the decision. That is more than "cheap", and it changes what 202 promises.
+
+*Options, your call:*
+1. Leave it. It is a laptop artifact: on a server with an NVMe disk a WAL flush is tens of microseconds, not hundreds. The k6 numbers stay labelled as laptop numbers.
+2. Asynchronous commit for the API's insert only, plus the writers upserting a missing order row from the shard's decision (about half a day, with a crash test).
+3. Batch the API's inserts: requests arriving within a millisecond or two share one multi-row INSERT and one flush. Keeps durability; about a day.

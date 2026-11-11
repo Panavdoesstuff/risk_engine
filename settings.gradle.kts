@@ -6,4 +6,5 @@ rootProject.name = "risk-engine"
 // M4: host (Redpanda event log + the process that runs one shard per partition), api (Spring Boot order API).
 // M4 part 2: writers (engine-out -> Postgres).
 // M5: broker-mock (a broker that times out, rejects, delays and repeats itself).
-include("engine", "replayer", "loadtest", "host", "api", "writers", "broker-mock")
+// M7: report (the crash-day replay and its write-up).
+include("engine", "replayer", "loadtest", "host", "api", "writers", "broker-mock", "report")

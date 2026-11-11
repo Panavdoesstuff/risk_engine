@@ -45,7 +45,9 @@ import riskengine.host.FlatJson;
  *       with GET before sending again.</li>
  *   <li><b>Rejects, 2%.</b> Acknowledged, then refused a moment later by callback.</li>
  *   <li><b>Delayed, split fills.</b> An order fills in one to three parts, each after a random delay.</li>
- *   <li><b>Duplicate callbacks, 10%.</b> The same fill, same fill id, delivered twice.</li>
+ *   <li><b>Duplicate callbacks, 10%.</b> The same fill, same fill id, delivered twice: half of them at the same
+ *       moment as the original (both reach the log and the shard drops one), half 2 s later (by then the
+ *       fill is booked and the fill ingester refuses the repeat).</li>
  * </ul>
  * What happens to an order (reject, how it splits, prices) is drawn from the key, so the same key always
  * gets the same fate; whether a particular request times out is drawn per request.
@@ -172,7 +174,7 @@ public final class MockBroker implements AutoCloseable {
         long delay = chaos.maxFillDelayMillis() == 0 ? 0 : r.nextLong(chaos.maxFillDelayMillis() + 1);
         if (r.nextDouble() < chaos.rejectRate()) {
             rejects.incrementAndGet();
-            schedule(delay, o.key(), "REJECTED", FlatJson.write("type", "REJECT", "key", o.key(), "accountId", o.accountId(), "instrumentId", o.instrumentId()), false);
+            schedule(delay, o.key(), "REJECTED", FlatJson.write("type", "REJECT", "key", o.key(), "accountId", o.accountId(), "instrumentId", o.instrumentId()), false, 0);
             return;
         }
         // One to three parts, in whole lots of 25 where the quantity allows it.
@@ -190,12 +192,16 @@ public final class MockBroker implements AutoCloseable {
                     "instrumentId", o.instrumentId(), "qty", sign * qty, "price", price);
             fills.incrementAndGet();
             boolean duplicate = r.nextDouble() < chaos.duplicateRate();
-            schedule(delay, o.key(), n == parts ? "FILLED" : null, body, duplicate);
+            long repeatAfter = duplicate && r.nextBoolean() ? LATE_DUPLICATE_MILLIS : 0;
+            schedule(delay, o.key(), n == parts ? "FILLED" : null, body, duplicate, repeatAfter);
             if (chaos.maxFillDelayMillis() > 0) delay += 1 + r.nextLong(chaos.maxFillDelayMillis() + 1);
         }
     }
 
-    private void schedule(long delayMillis, String key, String statusAfter, String body, boolean duplicate) {
+    /** How long after the original a late duplicate callback comes. */
+    static final long LATE_DUPLICATE_MILLIS = 2_000;
+
+    private void schedule(long delayMillis, String key, String statusAfter, String body, boolean duplicate, long repeatAfterMillis) {
         callbacksPending.addAndGet(duplicate ? 2 : 1);
         scheduler.schedule(() -> {
             deliver(body);
@@ -203,7 +209,7 @@ public final class MockBroker implements AutoCloseable {
         }, delayMillis, TimeUnit.MILLISECONDS);
         if (duplicate) {
             duplicateCallbacks.incrementAndGet();
-            scheduler.schedule(() -> deliver(body), delayMillis + 20, TimeUnit.MILLISECONDS);
+            scheduler.schedule(() -> deliver(body), delayMillis + repeatAfterMillis, TimeUnit.MILLISECONDS);
         }
     }
 

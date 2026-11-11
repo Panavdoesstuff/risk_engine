@@ -75,7 +75,8 @@ public final class Main {
                             last = now;
                             System.out.println("relay: " + relay.sent() + " orders sent in " + relay.requests() + " requests (" + relay.timeouts() + " timeouts, "
                                     + relay.confirmedByQuery() + " confirmed by query); " + ingester.fills() + " fills and " + ingester.rejects()
-                                    + " rejects written to the log, " + ingester.refused() + " callbacks refused");
+                                    + " rejects written to the log, " + ingester.refused() + " callbacks refused, "
+                                    + ingester.alreadyBooked() + " fills refused as already booked");
                         }
                     }
                 } catch (InterruptedException stop) {

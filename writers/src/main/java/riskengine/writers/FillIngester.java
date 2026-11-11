@@ -39,21 +39,27 @@ import riskengine.host.RedpandaLogs;
  *       foreign keys to both, so this also proves the account and the instrument exist, and it stops a
  *       fill being booked to the wrong account.</li>
  * </ul>
+ * A fill is also refused (422, audited, reason {@value #ALREADY_BOOKED}) if its broker fill id is already in
+ * the {@code fills} table. Such a fill has been applied by its shard and booked by the writers, so writing it
+ * again can only do harm: the shard forgets fill ids after two days of log time (decision 111) and would
+ * apply a very late repeat that Postgres then refuses, leaving the two disagreeing.
  * Otherwise it is written to the account's partition as a Fill (order id = the key) or an
  * OrderClosed(REJECTED), and answered 200 once the broker has acknowledged the write. If the log or the
  * database is unreachable the answer is 503 and the broker tries again.
  *
- * <p>Duplicates are let through on purpose. The broker may call twice; the shard ignores a fill id it has
- * seen, and that is the one place where "seen" is decided in log order.
+ * <p>A duplicate that arrives before the first copy is booked in Postgres is still let through: the shard
+ * ignores a fill id it has seen, and that is the one place where "seen" is decided in log order.
  */
 public final class FillIngester implements AutoCloseable {
+    /** The reason recorded when a fill id is already in the fills table. */
+    public static final String ALREADY_BOOKED = "fill already booked";
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._:-]{1,120}");
 
     private final String jdbcUrl, dbUser, dbPassword;
     private final RedpandaLogs log;
     private final java.util.function.LongSupplier clock;
     private final HttpServer server;
-    private final AtomicLong fills = new AtomicLong(), rejects = new AtomicLong(), refused = new AtomicLong();
+    private final AtomicLong fills = new AtomicLong(), rejects = new AtomicLong(), refused = new AtomicLong(), alreadyBooked = new AtomicLong();
     private final ThreadLocal<Connection> connections = new ThreadLocal<>();
 
     /** @param clock log time to stamp fills with: the replay's time (see ReplayClock), never the wall clock in a replay */
@@ -92,7 +98,7 @@ public final class FillIngester implements AutoCloseable {
             if (problem == null) {
                 respond(ex, 200, "ok");
             } else {
-                refused.incrementAndGet();
+                (problem.equals(ALREADY_BOOKED) ? alreadyBooked : refused).incrementAndGet();
                 audit(problem, body);
                 respond(ex, 422, problem);
             }
@@ -141,6 +147,15 @@ public final class FillIngester implements AutoCloseable {
                 if (!rs.next()) return "unknown order";
                 if (!rs.getString(1).equals(account)) return "order belongs to another account";
                 if (!rs.getString(2).equals(instrument)) return "order is for another instrument";
+            }
+        }
+        // A fill already booked has been applied; never write it to the log again.
+        if (event instanceof Fill fill) {
+            try (PreparedStatement ps = connection().prepareStatement("SELECT 1 FROM fills WHERE broker_fill_id = ?")) {
+                ps.setString(1, fill.fillId());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) return ALREADY_BOOKED;
+                }
             }
         }
         log.append((riskengine.events.AccountEvent) event);
@@ -198,7 +213,12 @@ public final class FillIngester implements AutoCloseable {
         return rejects.get();
     }
 
-    /** Callbacks refused because they did not match an order we placed. */
+    /** Fill callbacks refused because the fill id was already in the fills table. */
+    public long alreadyBooked() {
+        return alreadyBooked.get();
+    }
+
+    /** Callbacks refused because they did not match an order we placed (already-booked fills are counted apart). */
     public long refused() {
         return refused.get();
     }

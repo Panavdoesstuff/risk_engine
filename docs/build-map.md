@@ -159,12 +159,14 @@ Start `docs/decisions.md` on day one. Write one short entry every time you choos
 
 ### M7 — Crash day and polish
 
-- [ ] Replay 4 June 2024 against the seeded book
-- [ ] Report: Nifty + VIX chart with call/square-off markers; counts by account type; 5 worst accounts with timelines; busiest-minute latency; state whether VIX was intraday or daily
-- [ ] Verify index and VIX moves against NSE data before quoting numbers
-- [ ] Minimal WebSocket alerts page
-- [ ] README in the v2 structure; 60-second demo GIF
-- [ ] Deploy (a single small VM running Compose is enough)
+> **Done** (decisions.md #112–#119). Real data: NSE bhavcopy, Upstox one-minute Nifty and India VIX, lot size from NSE's circular; margin parameters checked against NSE Clearing's published rules. Also, first: the fill ingester refuses fills already booked (#112). The alerts are shown on the Grafana dashboard instead of a separate WebSocket page, and the project is not deployed: both left out by the M7 scope you set.
+
+- [x] Replay 4 June 2024 against the seeded book *(100,000 accounts, in-process and deterministic: `./gradlew :report:crashDay`)*
+- [x] Report: Nifty + VIX chart with call/square-off markers; counts by account type; 5 worst accounts with timelines; busiest-minute latency; state whether VIX was intraday or daily *([crash-day-2024-06-04.md](crash-day-2024-06-04.md); VIX is intraday, one-minute)*
+- [x] Verify index and VIX moves against NSE data before quoting numbers *(against press reports of NSE data; NSE's own download refuses scripts: decision 116)*
+- [ ] Minimal WebSocket alerts page *(not built: the Grafana dashboard's "Crash replay" row shows alerts firing)*
+- [x] README in the v2 structure; 60-second demo GIF *(README done; `scripts/demo.sh` plus recording steps; the GIF itself is yours to record)*
+- [ ] Deploy (a single small VM running Compose is enough) *(not done)*
 
 **Gate:** a stranger clones, runs one command, watches alerts fire.
 

@@ -133,7 +133,10 @@ public final class ShardHost implements AutoCloseable {
             } catch (java.util.concurrent.ExecutionException e) {
                 throw new IllegalStateException("cannot start shard " + p, e.getCause());
             }
-            ShardRunner runner = ShardRunner.withOffsets(state, log, (offset, o) -> out.publish(shardId, offset, o));
+            ShardRunner runner = ShardRunner.withOffsets(state, log, (offset, o) -> {
+                tickMetrics.output(shardId, o);
+                out.publish(shardId, offset, o);
+            });
             runners.add(runner);
             tickMetrics.activate(p);
             long[] lastSnapshotAt = {lastSnapshotTime(state)};

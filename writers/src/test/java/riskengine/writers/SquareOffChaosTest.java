@@ -100,6 +100,16 @@ class SquareOffChaosTest {
         }
     }
 
+    /** One booked fill: broker fill id, order id, account, instrument, qty, price. */
+    static String[] bookedFill() throws SQLException {
+        try (Connection c = DriverManager.getConnection(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+             Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("SELECT broker_fill_id, order_id, account_id, instrument_id, qty, price FROM fills ORDER BY broker_fill_id LIMIT 1")) {
+            if (!rs.next()) throw new AssertionError("no fills booked");
+            return new String[] {rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4), String.valueOf(rs.getLong(5)), rs.getBigDecimal(6).toPlainString()};
+        }
+    }
+
     /** Everything in one partition of a topic, decoded with {@code decode}. */
     static <T> List<T> readPartition(String bootstrap, String topic, int partition, java.util.function.Function<String, T> decode) {
         Properties p = new Properties();
@@ -286,9 +296,12 @@ class SquareOffChaosTest {
             long overFilledInPostgres = count("SELECT count(*) FROM square_off_legs l LEFT JOIN "
                     + "(SELECT order_id, sum(qty) q FROM fills GROUP BY order_id) f ON f.order_id = l.leg_key "
                     + "WHERE coalesce(f.q, 0) <> CASE l.status WHEN 'FILLED' THEN l.qty ELSE 0 END OR l.status NOT IN ('FILLED', 'REJECTED')");
-            // (d) Duplicate callbacks reached the log and were dropped there.
+            // (d) Every duplicate callback was stopped: by the shard if it reached the log before the first copy
+            //     was booked, by the fill ingester if it came after.
             long duplicatesDropped = shards.stream().mapToLong(ShardState::duplicateFills).sum();
-            assertEquals(b.get("duplicateCallbacks"), duplicatesDropped, "every duplicate callback was ignored by a shard");
+            assertEquals(b.get("duplicateCallbacks"), duplicatesDropped + ingester.alreadyBooked(),
+                    "every duplicate callback was ignored by a shard or refused as already booked");
+            assertEquals(ingester.alreadyBooked(), b.get("callbacksRefused"), "the only callbacks refused were already-booked repeats");
             assertEquals(positionChanges, count("SELECT count(*) FROM fills"), "one fills row per fill the engine applied");
             // Fills carry replay time (the ticks' 2024 clock), not the day the test ran.
             long firstTick = Fixtures.T0 + 60_000L, lastTick = Fixtures.T0 + TICKS * 60_000L;
@@ -335,14 +348,14 @@ class SquareOffChaosTest {
                       square-off      %d episodes (%d by hand): %d resolved, %d exhausted; %d legs planned, %d filled, %d rejected and re-planned
                       broker          %d distinct keys, executed %d; asked %d times (%d requests lost, %d answers lost, %d repeats of a known key)
                       relay           %d timeouts: %d confirmed by query (not re-sent), %d not at the broker (re-sent)
-                      callbacks       %d fills in %d callbacks' worth of duplicates: %d duplicates, %d dropped by the shards; %d refused by the ingester
+                      callbacks       %d fills in %d callbacks' worth of duplicates: %d duplicates, %d dropped by the shards, %d refused as already booked; %d refused by the ingester
                       Postgres        %d fills, %d ledger transactions
                       GATE  legs closed twice %d (engine) / %d (Postgres)   surplus legs %d   unbalanced ledger transactions %d   shard vs reference mismatches %d
                     """,
                     ACCOUNTS, TICKS, userOrders, seconds, episodesOpened, manual, resolved, exhausted, legQty.size(), legsFilled, legsRejected,
                     keys, broker.executed(), b.get("placeRequests"), b.get("timeoutsRequestLost"), b.get("timeoutsResponseLost"), b.get("repeatsOfAKnownKey"),
                     relay.timeouts(), relay.confirmedByQuery(), relay.resentAfterTimeout(),
-                    b.get("fills"), b.get("fills") + b.get("duplicateCallbacks"), b.get("duplicateCallbacks"), duplicatesDropped, ingester.refused(),
+                    b.get("fills"), b.get("fills") + b.get("duplicateCallbacks"), b.get("duplicateCallbacks"), duplicatesDropped, ingester.alreadyBooked(), ingester.refused(),
                     count("SELECT count(*) FROM fills"), transactions, legsClosedTwice, overFilledInPostgres, surplusLegs, unbalanced, referenceMismatches);
 
             // The gate.
@@ -354,7 +367,8 @@ class SquareOffChaosTest {
             // And the chaos really happened.
             assertTrue(episodesOpened >= ACCOUNTS / 8 && legQty.size() > episodesOpened / 2, "enough square-off to mean something");
             assertTrue(b.get("timeoutsRequestLost") > 0 && b.get("timeoutsResponseLost") > 0 && relay.confirmedByQuery() > 0 && relay.resentAfterTimeout() > 0, b.toString());
-            assertTrue(legsRejected > 0 && duplicatesDropped > 0 && transactions > 0, "rejects " + legsRejected + ", duplicates " + duplicatesDropped);
+            assertTrue(legsRejected > 0 && duplicatesDropped > 0 && ingester.alreadyBooked() > 0 && transactions > 0,
+                    "rejects " + legsRejected + ", duplicates dropped by shards " + duplicatesDropped + ", refused as booked " + ingester.alreadyBooked());
             assertEquals(0, ingester.refused(), "the broker only called back about orders we placed");
             assertEquals(0, writer.failedBatches());
 
@@ -371,7 +385,21 @@ class SquareOffChaosTest {
             assertEquals(422, post(url, "{\"type\":\"FILL\",\"key\":\"" + someLeg + "\",\"fillId\":\"X5|TICK\",\"accountId\":\"" + k[0] + "\",\"instrumentId\":\"" + k[2] + "\",\"qty\":25,\"price\":10}"));
             assertEquals(422, post(url, "not json at all"));
             assertEquals(before, totalEnd(bootstrap, Topics.ENGINE_EVENTS), "nothing refused was written to the log");
-            assertEquals(6, count("SELECT count(*) FROM audit_log WHERE actor = 'fill-ingester' AND action = 'CALLBACK_REFUSED'"), "each refusal is on record");
+            assertEquals(6, count("SELECT count(*) FROM audit_log WHERE actor = 'fill-ingester' AND action = 'CALLBACK_REFUSED' AND reason <> '"
+                    + FillIngester.ALREADY_BOOKED + "'"), "each refusal is on record");
+
+            // A fill already booked in Postgres is refused before it reaches the log, however late it comes.
+            // (The shard forgets fill ids after two days of log time and would apply it again.)
+            String[] booked = bookedFill();
+            long bookedBefore = ingester.alreadyBooked();
+            long auditedBefore = count("SELECT count(*) FROM audit_log WHERE actor = 'fill-ingester' AND reason = '" + FillIngester.ALREADY_BOOKED + "'");
+            assertEquals(422, post(url, "{\"type\":\"FILL\",\"key\":\"" + booked[1] + "\",\"fillId\":\"" + booked[0] + "\",\"accountId\":\"" + booked[2]
+                    + "\",\"instrumentId\":\"" + booked[3] + "\",\"qty\":" + booked[4] + ",\"price\":" + booked[5] + "}"));
+            assertEquals(before, totalEnd(bootstrap, Topics.ENGINE_EVENTS), "an already-booked fill is not written to the log");
+            assertEquals(bookedBefore + 1, ingester.alreadyBooked());
+            assertEquals(auditedBefore + 1, count("SELECT count(*) FROM audit_log WHERE actor = 'fill-ingester' AND reason = '" + FillIngester.ALREADY_BOOKED + "'"),
+                    "the refusal is on record");
+            assertEquals(6, ingester.refused(), "counted as already booked, not as a mismatch (the 6 are the bad callbacks above)");
         }
     }
 

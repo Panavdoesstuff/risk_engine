@@ -24,6 +24,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import riskengine.replayer.CsvSupport;
 
 /**
@@ -32,6 +34,7 @@ import riskengine.replayer.CsvSupport;
  *
  * <p>Input needs a header with OPEN, HIGH, LOW, CLOSE and either a single DATETIME/TIMESTAMP column, or
  * DATE + TIME columns, or DATE alone (daily). Timestamps without an offset are read as IST.
+ * A {@code .json} file is read as an Upstox historical-candle response instead (see {@link #readUpstoxCandles}).
  * A {@code .meta} sidecar records the detected resolution so the crash-day report can state honestly
  * whether VIX was intraday or daily.
  */
@@ -62,7 +65,8 @@ public final class MarketDataLoader {
 
     /** @param from inclusive, nullable; @param to inclusive, nullable */
     public static Series load(Path file, LocalDate from, LocalDate to) {
-        List<String> lines = CsvSupport.lines(file);
+        List<String> lines = file.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".json")
+                ? readUpstoxCandles(file) : CsvSupport.lines(file);
         if (lines.isEmpty()) throw new IllegalArgumentException(file + ": empty file");
         Map<String, Integer> idx = CsvSupport.index(CsvSupport.split(lines.get(0)));
         int cO = CsvSupport.require(idx, "OPEN", file), cH = CsvSupport.require(idx, "HIGH", file),
@@ -145,6 +149,40 @@ public final class MarketDataLoader {
             throw new UncheckedIOException(e);
         }
         return meta;
+    }
+
+    private static final Pattern UPSTOX_RESPONSE = Pattern.compile(
+            "\\s*\\{\\s*\"status\"\\s*:\\s*\"success\"\\s*,\\s*\"data\"\\s*:\\s*\\{\\s*\"candles\"\\s*:\\s*\\[(.*)]\\s*}\\s*}\\s*", Pattern.DOTALL);
+    private static final String NUMBER = "\\s*(-?[0-9]+(?:\\.[0-9]+)?)\\s*";
+    private static final Pattern UPSTOX_CANDLE = Pattern.compile(
+            "\\s*\\[\\s*\"([^\"]+)\"\\s*," + NUMBER + "," + NUMBER + "," + NUMBER + "," + NUMBER + "," + NUMBER + "," + NUMBER + "]\\s*(,|$)");
+
+    /**
+     * An Upstox v3 historical-candle response, as CSV lines with a DATETIME header:
+     * {@code {"status":"success","data":{"candles":[[time, open, high, low, close, volume, oi], ...]}}},
+     * newest first (load() sorts). Volume and open interest are dropped (zero for an index). Anything
+     * else in the file is refused rather than skipped.
+     */
+    public static List<String> readUpstoxCandles(Path file) {
+        String text;
+        try {
+            text = Files.readString(file, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        Matcher whole = UPSTOX_RESPONSE.matcher(text);
+        if (!whole.matches()) throw new IllegalArgumentException(file + ": not an Upstox candle response {\"status\":\"success\",\"data\":{\"candles\":[...]}}");
+        String body = whole.group(1);
+        List<String> out = new ArrayList<>();
+        out.add("DATETIME,OPEN,HIGH,LOW,CLOSE");
+        Matcher m = UPSTOX_CANDLE.matcher(body);
+        int at = 0;
+        while (at < body.length() && !body.substring(at).isBlank()) {
+            if (!m.find(at) || m.start() != at) throw new IllegalArgumentException(file + ": unexpected candle near character " + at);
+            out.add(m.group(1) + "," + m.group(2) + "," + m.group(3) + "," + m.group(4) + "," + m.group(5));
+            at = m.end();
+        }
+        return out;
     }
 
     private static Integer firstOf(Map<String, Integer> idx, String... names) {
