@@ -30,6 +30,17 @@ tasks.register<JavaExec>("stress") {
     workingDir = rootDir
 }
 
+// M6: tick-to-margin latency at 100k accounts, through Redpanda:
+//   ./gradlew :loadtest:scale --args="--bootstrap localhost:29092"
+tasks.register<JavaExec>("scale") {
+    group = "verification"
+    description = "Ticks at 10/50/100 per second plus order traffic; p50/p99 tick-to-margin at 100k accounts."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("riskengine.loadtest.ScaleRun")
+    jvmArgs("-Xms6g", "-Xmx6g", "-XX:+AlwaysPreTouch")
+    workingDir = rootDir
+}
+
 tasks.named<JavaExec>("run") {
     workingDir = rootDir
 }

@@ -1,6 +1,6 @@
 # Architecture
 
-*Filled in as milestones land. Current state: M5 (square-off pipeline). Snapshots, recovery and the scale numbers are M6.*
+*Filled in as milestones land. Current state: M6 part 1 (scale and metrics). Snapshots and recovery are M6 part 2.*
 
 ```
 replayer ──ticks (every partition, global tick_seq)──▶ engine-events[0..N-1] ──▶ ShardRunner × N
@@ -164,3 +164,14 @@ Compared: every output in order, every account's final state, and each live shar
 5. When the leg's fills add up to the leg, the shard looks again: back under 100% → RESOLVED; otherwise the next leg (seq 2). A broker reject (`OrderClosed`) drops the leg and plans again with seq + 1. Nothing useful left to close → EXHAUSTED, and the account is blocked for risk-ops.
 
 **Status, as written to `accounts.status`:** BLOCKED (risk-ops, or an exhausted square-off) › SQUARING_OFF (episode open) › MARGIN_CALL (level ≥ MARGIN_CALL) › ACTIVE.
+
+## Metrics and the scale run (M6 part 1)
+
+```
+ShardRunner p ── after each event ──▶ observer (host) ── clock read here, never in the shard
+                                          │  tick? latency = now − when the tick was sent
+                                          ▼
+                     TickMetrics: histogram + counters ──▶ shard host :9100/metrics ◀── Prometheus (2 s) ◀── Grafana "Risk engine"
+```
+
+`./gradlew :loadtest:scale` runs the same `ShardHost` in-process against a broker: 100k accounts, ticks paced at 10, 50 and 100 per second with 1,000 orders/s alongside, then flat out. Per tick per shard it records the exact time from send to applied, and reports exact percentiles. In compose, `replayer synth --rate 50 --seconds 60 --redpanda localhost:19092` drives the stack and the dashboard shows the same histogram.

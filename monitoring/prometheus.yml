@@ -1,0 +1,8 @@
+# Scrapes the shard host's /metrics (tick-to-margin histogram, ticks applied, per-shard lag, GC).
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+scrape_configs:
+  - job_name: shard-host
+    static_configs:
+      - targets: ["shard-host:9100"]

@@ -25,6 +25,9 @@ public final class AccountVector {
     private double exposureNotional;    // sum |qty| x notional over futures and short options
     private double futuresValue;        // sum qty x current futures price
     private double futuresCost;         // sum qty x average entry price of futures
+    // MarginCalculator's lookup cache: this vector's underlying's parameters under one config. Not state.
+    MarginConfig paramsFor;
+    UnderlyingParams params;
 
     public AccountVector(String underlying) {
         this.underlying = underlying;

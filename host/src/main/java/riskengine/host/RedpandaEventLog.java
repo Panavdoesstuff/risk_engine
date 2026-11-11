@@ -45,6 +45,12 @@ final class RedpandaEventLog implements EventLog {
     private KafkaConsumer<byte[], byte[]> consumer; // created on first read, so write-only users never open one
     private long nextReadOffset = -1;               // offset the consumer (plus buffer) will deliver next
     private boolean closed;
+    // When each recently read record was appended to the partition (the broker's record timestamp, set by
+    // the producer when it sent the record), by offset. A ring big enough for what is buffered plus one
+    // batch being applied; read by the same thread that reads the log.
+    private static final int RING = 1 << 14;
+    private final long[] ringOffsets = new long[RING];
+    private final long[] ringTimes = new long[RING];
 
     RedpandaEventLog(RedpandaLogs topicLogs, String bootstrap, String topic, int partition, Duration pollWait) {
         this.topicLogs = topicLogs;
@@ -76,6 +82,9 @@ final class RedpandaEventLog implements EventLog {
                     long left = pollWait.toNanos();
                     while (buffered.isEmpty() && left > 0) {
                         for (ConsumerRecord<byte[], byte[]> r : c.poll(Duration.ofNanos(left)).records(tp)) {
+                            int slot = (int) (r.offset() & (RING - 1));
+                            ringOffsets[slot] = r.offset();
+                            ringTimes[slot] = r.timestamp();
                             buffered.add(new LoggedEvent(r.offset(), EventCodec.decode(new String(r.value(), StandardCharsets.UTF_8))));
                         }
                         left = deadline - System.nanoTime();
@@ -90,6 +99,15 @@ final class RedpandaEventLog implements EventLog {
             if (!out.isEmpty()) nextReadOffset = out.get(out.size() - 1).offset() + 1;
             return out;
         }
+    }
+
+    /**
+     * Wall-clock time (epoch ms) at which the record at {@code offset} was handed to the producer, or -1 if
+     * it is no longer remembered. Only for records this log has read recently.
+     */
+    long appendedAtMillis(long offset) {
+        int slot = (int) (offset & (RING - 1));
+        return ringOffsets[slot] == offset ? ringTimes[slot] : -1;
     }
 
     @Override

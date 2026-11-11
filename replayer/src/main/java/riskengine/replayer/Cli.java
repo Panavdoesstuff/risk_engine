@@ -47,6 +47,12 @@ public final class Cli {
                   on a Redpanda broker. This is the only tick writer, and it refuses to write twice.
                   --pace-ms pauses between ticks when writing to Redpanda (for watching a replay).
 
+              synth        --redpanda HOST:PORT --rate TICKS_PER_SECOND --seconds N [--partitions 4]
+                           [--underlying NIFTY] [--seed 1]
+                  SYNTHETIC live ticks for load: carries on from the latest tick in engine-events
+                  (next tick_seq, from its spot and VIX, its log time plus 1/rate s per tick), with a
+                  small random walk, at the given rate. Refuses if there is no tick yet.
+
               demo         --out DIR
                   Write SYNTHETIC inputs (made-up prices, not market data) so the whole pipeline can be
                   run without the real files: an instruments file as of 2024-06-03, and raw minute bars
@@ -67,6 +73,9 @@ public final class Cli {
                 case "bars" -> bars(f);
                 case "seed" -> seed(f);
                 case "ticks" -> ticks(f);
+                case "synth" -> riskengine.replayer.ticks.SyntheticTicks.run(req(f, "redpanda"), Integer.parseInt(f.getOrDefault("partitions", "4")),
+                        f.getOrDefault("underlying", "NIFTY"), Double.parseDouble(req(f, "rate")), Integer.parseInt(req(f, "seconds")),
+                        Long.parseLong(f.getOrDefault("seed", "1")));
                 case "demo" -> System.out.print(riskengine.replayer.demo.DemoData.write(Path.of(req(f, "out"))));
                 default -> throw new IllegalArgumentException("unknown command " + args[0]);
             }

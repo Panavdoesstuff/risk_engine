@@ -2,15 +2,15 @@
 #
 #   docker compose up -d                  infrastructure only: Postgres (+ migrations), Redpanda (+ topics), Redis
 #   docker compose --profile app up -d    ... plus the engine: book loader, shard host, Postgres writers, order API,
-#                                         outbox relay + fill ingester, and a mock broker (BROKER_CHAOS=full|none)
+#                                         outbox relay + fill ingester, a mock broker (BROKER_CHAOS=full|none),
+#                                         Prometheus (:9090) and Grafana (:3000, dashboard "Risk engine")
 #
 # The engine services need a start-of-day book under ./data (see data/README.md), which is why they are
 # behind a profile: the infrastructure must come up on a machine that has no data yet.
 # scripts/m4-e2e.sh runs the whole thing end to end with synthetic data.
 #
 # Host ports can be moved with POSTGRES_PORT, REDPANDA_PORT, REDPANDA_ADMIN_PORT, REDIS_PORT, API_PORT,
-# METRICS_PORT and BROKER_PORT, so a second copy (docker compose -p other ...) can run beside this one.
-# Prometheus + Grafana are added in M6.
+# METRICS_PORT, BROKER_PORT, PROMETHEUS_PORT and GRAFANA_PORT, so a second copy (docker compose -p other ...) can run beside this one.
 
 name: risk-engine
 
@@ -166,6 +166,30 @@ services:
       book-loader: { condition: service_completed_successfully }
       topic-init: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
+
+  # ---------------------------------------------------------------- monitoring (profile: app)
+
+  prometheus:
+    profiles: [app]
+    image: prom/prometheus:v2.55.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=2d"]
+    volumes: ["./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["${PROMETHEUS_PORT:-9090}:9090"]
+
+  grafana:
+    profiles: [app]
+    image: grafana/grafana:11.3.1
+    environment:
+      # DEV ONLY: anyone who can reach the port can view; the admin password is a published default.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/risk-engine.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["${GRAFANA_PORT:-3000}:3000"]
+    depends_on: [prometheus]
 
 volumes:
   pgdata:

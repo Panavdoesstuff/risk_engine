@@ -145,10 +145,12 @@ Start `docs/decisions.md` on day one. Write one short entry every time you choos
 
 ### M6 — Scale and recovery (go/no-go)
 
-- [ ] Synthetic tick generator at 10, 50, 100 ticks/s
-- [ ] Gatling or k6 order traffic in parallel
-- [ ] 100k accounts, ~5 positions each
-- [ ] Prometheus metrics: tick-to-margin latency histogram, per-shard lag, ticks/s; Grafana dashboard
+> **Part 1 (scale) done** (decisions.md #87–#94); **part 2 (snapshots, recovery, kill -9) to do.** Also done here, as follow-ups approved after M5: fills stamped with replay time, several outbox relays with `FOR UPDATE SKIP LOCKED`.
+
+- [x] Synthetic tick generator at 10, 50, 100 ticks/s *(`./gradlew :loadtest:scale` measures; `replayer synth` drives the compose stack)*
+- [x] Gatling or k6 order traffic in parallel *(1,000 orders/s written to the log, not over HTTP: #92)*
+- [x] 100k accounts, ~5 positions each
+- [x] Prometheus metrics: tick-to-margin latency histogram, per-shard lag, ticks/s; Grafana dashboard
 - [ ] Snapshots every M seconds of **log time**: state, partition offset, state hash
 - [ ] Recovery: load snapshot, replay from offset; re-emitted square-offs carry same keys and are dropped by the unique constraint
 - [ ] `kill -9` script mid-run; compare final hash with uninterrupted run; count broker calls

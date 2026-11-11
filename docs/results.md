@@ -4,9 +4,9 @@ Fill in as you go. Every number names the commit and command that produced it.
 
 | Metric | Value | Where it comes from |
 | --- | --- | --- |
-| Accounts | | Load test config |
-| p99 tick-to-margin | | Grafana / M6 |
-| Sustained ticks/s | | M6 |
+| Accounts | **100,000** × 5 positions, 4 shards | M6 scale run |
+| p99 tick-to-margin | **28.8 / 14.2 / 19.7 ms** at 10 / 50 / 100 ticks/s (target 50 ms) | M6 scale run |
+| Sustained ticks/s | **119** (slowest shard, flat out, 1,000 orders/s alongside) | M6 scale run |
 | Incremental speed-up | **27.4×** vs naive, **3.1×** vs full recompute (details below) | JMH / M3 |
 | Mismatches over 1M events | **0** (in-memory logs, and again through Redpanda; details below) | M4 harness |
 | Duplicate closes under chaos | **0** legs closed twice, 0 surplus legs, 0 unbalanced ledger transactions (details below) | M5 chaos gate |
@@ -28,6 +28,50 @@ The average is the same as before the rolling rebuild (1,402 ± 12 µs), as expe
 Read this honestly: most of the 27× is "price each instrument once", which the full recompute also does. The delta update itself is the 3.1×. See decisions.md #44.
 
 At this rate one shard handles roughly 700 ticks per second for 10,000 accounts. M6 measures the real target (100k accounts, p99).
+
+## M6 part 1: tick-to-margin at 100k accounts
+
+`./gradlew :loadtest:scale --args="--bootstrap localhost:29092"` on branch `m6-scale`. Apple M4 laptop (4 performance + 6 efficiency cores, 16 GB), JDK 25.0.2, `-Xmx6g`, G1. One Redpanda v24.2.7 container with the same flags as compose (`--smp=1 --memory=1G`). The shard host is the same class compose runs, in-process so each tick can be timed exactly. 100,000 accounts × 5 positions over 166 Nifty instruments, 4 shards (25,000 accounts each). Every tick moves spot and VIX, so every held instrument reprices and every account is recomputed. 1,000 user orders/s go to random accounts alongside, each through the full pre-trade check. Each phase is 60 s, after a 10 s warm-up that isn't counted. System load average at the start: 2.6 (the machine otherwise quiet; see below).
+
+**Tick-to-margin** is measured from just before the tick is handed to the producer to the moment the shard has recomputed every affected account and handed its outputs on (decision 89). One sample per tick per shard; exact percentiles.
+
+| Ticks/s | Achieved | Samples | p50 | p90 | **p99** | p99.9 | max | Shard CPU per tick | Max shard lag | GCs (time) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 10.0/s | 2,400 | 13.3 ms | 18.1 ms | **28.8 ms** | 53.1 ms | 55.3 ms | 13.1 ms | 2 events | 7 (218 ms) |
+| 50 | 50.0/s | 12,000 | 8.0 ms | 9.0 ms | **14.2 ms** | 21.4 ms | 29.5 ms | 7.1 ms | 2 events | 10 (129 ms) |
+| 100 | 100.0/s | 24,000 | 8.0 ms | 9.3 ms | **19.7 ms** | 52.5 ms | 66.9 ms | 6.9 ms | 10 events | 20 (209 ms) |
+| flat out | **119/s sustained** by the slowest shard | | | | | | | | | 9 (93 ms) |
+
+Under 50 ms at every rate. Reading it:
+- **10 ticks/s is slower than 50 and 100.** With 100 ms of idle between ticks, the shard threads' caches go cold and the cores clock down; the same tick costs 13.1 ms of CPU instead of 6.9 ms. This is the usual laptop behaviour, not queueing (lag never exceeds 2 events).
+- **p99.9 and max at 100 ticks/s (52–67 ms) are GC pauses and the odd tick that lands on an efficiency core.** p99 has about 30 ms of room; p99.9 does not.
+- **Headroom is about 20%.** Flat out, the slowest shard manages 119 ticks/s. A burst above that queues, and latency climbs with the queue.
+
+**How it got here (decision 94).** The first run missed badly (p99 0.96 s at 10 ticks/s, unbounded at 50 and 100; 35 ticks/s sustained). Profiling: GC and boxing were not the problem. That run had another job on the machine using about half the cores, and the tick loop's memory access pattern made four shards fight over memory bandwidth. Old engine against new, same harness, same quiet machine:
+
+| | Old tick loop | New tick loop |
+| --- | ---: | ---: |
+| Shard CPU per tick (50 / 100 ticks/s) | 9.5 / 9.4 ms | 7.1 / 6.9 ms |
+| p99 at 50 ticks/s | 17.0 ms | 14.2 ms |
+| p99 at 100 ticks/s | 3,414 ms (can't keep up) | 19.7 ms |
+| Flat out | 100 ticks/s | 119 ticks/s |
+
+The incremental JMH benchmark on one thread is unchanged by the restructure (10,000 accounts: 1.64 ms per tick on a quiet machine; 25,000 accounts: 4.2 ms). The win appears only with several shards running at once.
+
+**The 1M-event stress run after the change:** 0 mismatches against the single-threaded reference (outputs, final state, replay hash), and the shards apply it in 3.0 s (was 4.5 s).
+
+**In compose:** `replayer synth --rate 50 --seconds 10` after the replay; Prometheus has the histogram, and Grafana serves the "Risk engine" dashboard and queries Prometheus (checked by `scripts/m4-e2e.sh`). The compose stack is 200 accounts and its window includes the replay's 375 ticks written all at once, so its latency figures there say nothing about scale.
+
+### Follow-ups from M5
+
+| Check | Result |
+| --- | --- |
+| Three outbox relays, 3,000 rows, well-behaved broker | 3,000 requests, 0 duplicates, each row attempted once, about 1,000 per relay |
+| The same with the row lock removed | 7,490 requests for 3,000 rows: the test catches it |
+| Three relays under 5% timeouts, 1,000 rows | every extra request is a resend of one the broker never received; 0 repeats of a key it had |
+| Fills in the chaos gate | every `fills.filled_at` and ledger `log_time` falls inside the replay's tick times |
+
+`./gradlew build`: 139 tests, 0 failures, re-run from scratch.
 
 ## M5: square-off under full broker chaos
 

@@ -51,11 +51,14 @@ public final class FillIngester implements AutoCloseable {
 
     private final String jdbcUrl, dbUser, dbPassword;
     private final RedpandaLogs log;
+    private final java.util.function.LongSupplier clock;
     private final HttpServer server;
     private final AtomicLong fills = new AtomicLong(), rejects = new AtomicLong(), refused = new AtomicLong();
     private final ThreadLocal<Connection> connections = new ThreadLocal<>();
 
-    public FillIngester(int port, String jdbcUrl, String dbUser, String dbPassword, RedpandaLogs log) throws IOException {
+    /** @param clock log time to stamp fills with: the replay's time (see ReplayClock), never the wall clock in a replay */
+    public FillIngester(int port, String jdbcUrl, String dbUser, String dbPassword, RedpandaLogs log, java.util.function.LongSupplier clock) throws IOException {
+        this.clock = clock;
         this.jdbcUrl = jdbcUrl;
         this.dbUser = dbUser;
         this.dbPassword = dbPassword;
@@ -112,7 +115,7 @@ public final class FillIngester implements AutoCloseable {
         if (type == null || key == null || account == null || instrument == null) return "missing field";
         if (!ID.matcher(key).matches() || !ID.matcher(account).matches() || !ID.matcher(instrument).matches()) return "malformed id";
         Event event;
-        long now = System.currentTimeMillis();
+        long now = clock.getAsLong(); // replay time: the latest tick's log time
         if (type.equals("FILL")) {
             String fillId = f.get("fillId");
             if (fillId == null || !ID.matcher(fillId).matches()) return "malformed fill id";

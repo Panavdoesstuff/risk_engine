@@ -9,7 +9,8 @@ import riskengine.host.Topics;
  * <pre>
  *   writers run        [--bootstrap localhost:19092] [--jdbc-url jdbc:postgresql://localhost:5432/risk]
  *   writers load-book  --instruments FILE --book DIR [--trade-date 2024-06-03] [--jdbc-url ...]
- *   writers relay      --broker-url http://localhost:9300 [--listen-port 9200] [--partitions 4] [--bootstrap ...] [--jdbc-url ...]
+ *   writers relay      --broker-url http://localhost:9300 [--listen-port 9200] [--partitions 4] [--name relay-1] [--bootstrap ...] [--jdbc-url ...]
+ *                      several may run at once (each locks the outbox rows it sends)
  *                      outbox -> broker, and the broker's callbacks -> the log (fill ingester)
  * </pre>
  * Database user and password come from DB_USER / DB_PASSWORD (default risk / risk, the compose values).
@@ -57,8 +58,10 @@ public final class Main {
             String bootstrap = f.getOrDefault("bootstrap", "localhost:19092");
             int partitions = Integer.parseInt(f.getOrDefault("partitions", "4"));
             try (riskengine.host.RedpandaLogs log = new riskengine.host.RedpandaLogs(bootstrap, Topics.ENGINE_EVENTS, partitions, java.time.Duration.ofMillis(100));
-                 FillIngester ingester = new FillIngester(Integer.parseInt(f.getOrDefault("listen-port", "9200")), jdbcUrl, user, password, log).start();
-                 OutboxRelay relay = new OutboxRelay(jdbcUrl, user, password, f.get("broker-url"), log, java.time.Duration.ofSeconds(1))) {
+                 riskengine.host.ReplayClock clock = new riskengine.host.ReplayClock(bootstrap, Topics.ENGINE_EVENTS);
+                 FillIngester ingester = new FillIngester(Integer.parseInt(f.getOrDefault("listen-port", "9200")), jdbcUrl, user, password, log, clock).start();
+                 OutboxRelay relay = new OutboxRelay(jdbcUrl, user, password, f.get("broker-url"), log, java.time.Duration.ofSeconds(1), clock)
+                         .named(f.getOrDefault("name", System.getenv().getOrDefault("HOSTNAME", "relay")))) {
                 Thread main = Thread.currentThread();
                 Runtime.getRuntime().addShutdownHook(new Thread(main::interrupt));
                 Thread t = relay.start();

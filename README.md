@@ -2,7 +2,7 @@
 
 A deterministic, sharded margin engine for Indian index derivatives (Nifty, Bank Nifty), replayed against the 4 June 2024 election-result crash.
 
-**Status:** M5 done, the MVP line: an idempotent square-off pipeline (expected-utilisation status machine, greedy one-leg-at-a-time planner, transactional outbox, a chaos broker, a double-entry ledger) on top of M4's sharded engine, order API and Postgres projection. Under full broker chaos: 0 legs closed twice, 0 surplus legs, every ledger transaction sums to zero. Next is M6 (scale and recovery). M1 is waiting only on real market data. Nifty only until the end of M5. Numbers so far: [docs/results.md](docs/results.md). See [docs/build-map.md](docs/build-map.md) for the plan and [docs/decisions.md](docs/decisions.md) for why things are the way they are.
+**Status:** M6 part 1 done: at 100,000 accounts (5 positions each, 4 shards), p99 tick-to-margin is **28.8 / 14.2 / 19.7 ms at 10 / 50 / 100 ticks/s** (target 50 ms), with the slowest shard sustaining 119 ticks/s, on a laptop. Before that, M5 (the MVP line): an idempotent square-off pipeline under a chaos broker (0 legs closed twice, 0 surplus legs, every ledger transaction sums to zero) on top of M4's sharded engine, order API and Postgres projection. Next: M6 part 2 (snapshots, recovery, `kill -9`). M1 is waiting only on real market data.
 
 ## Quick start
 
@@ -12,6 +12,7 @@ docker compose up -d     # Postgres (+ migrations), Redpanda (+ topics), Redis
 ./scripts/m1-gate.sh     # checks schema, topics, ledger/audit constraints, seed reproducibility
 ./scripts/m4-e2e.sh      # the whole engine in docker compose, synthetic data, chaos broker: ticks -> shards -> orders and square-offs filled -> Postgres
 ./gradlew :loadtest:stress   # the 1M-event concurrency stress test
+./gradlew :loadtest:scale --args="--bootstrap localhost:19092"   # p50/p99 tick-to-margin at 100k accounts, 10/50/100 ticks/s
 ```
 
 Market data setup: [data/README.md](data/README.md). How margin is computed, with every number worked by hand: [docs/margin-example-short-straddle.md](docs/margin-example-short-straddle.md).
@@ -38,7 +39,8 @@ When an account stays at 120% utilisation or more for three ticks, its shard ope
 | `writers/` | `engine-out` → Postgres in batches: positions, account status, orders + outbox (one transaction), square-off episodes and legs, fills, double-entry ledger, audit log. Safe to replay. Also the outbox relay (to the broker) and the fill ingester (broker callbacks → the log). |
 | `broker-mock/` | A broker that times out, rejects, fills late and in parts, and calls back twice. Idempotent on the order key. |
 | `replayer/` | Bhavcopy → instruments, minute-bar/VIX normaliser, seeded start-of-day book generator, bars → ticks (the only tick writer; to files or to Redpanda), synthetic demo inputs. |
-| `loadtest/` | JMH benchmarks (`./gradlew :loadtest:run --args="TickBenchmark"`) and the concurrency stress harness (`./gradlew :loadtest:stress`). |
+| `loadtest/` | JMH benchmarks (`./gradlew :loadtest:run --args="TickBenchmark"`), the concurrency stress harness (`./gradlew :loadtest:stress`) and the scale run (`./gradlew :loadtest:scale`). |
+| `monitoring/` | Prometheus config and the provisioned Grafana dashboard (`docker compose --profile app up`, then http://localhost:3000). |
 | `db/migrations/` | Flyway SQL for the full data model. |
 | `scripts/` | Topic setup, milestone gate checks. |
 | `docs/` | Build map, decisions, architecture, results. |

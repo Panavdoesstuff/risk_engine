@@ -37,6 +37,12 @@ public final class LagMonitor implements AutoCloseable {
     private final Thread sampler;
     private volatile boolean running = true;
     private HttpServer server;
+    private volatile TickMetrics tickMetrics;
+
+    /** Also serve these at /metrics. */
+    void include(TickMetrics m) {
+        this.tickMetrics = m;
+    }
 
     public LagMonitor(String bootstrap, String eventsTopic, List<ShardRunner> runners) {
         this.runners = List.copyOf(runners);
@@ -89,6 +95,8 @@ public final class LagMonitor implements AutoCloseable {
         gauge(sb, "risk_shard_log_end_offset", "End offset of the shard's partition at the last sample.", endOffsets::get);
         gauge(sb, "risk_shard_up", "1 while the shard is running, 0 once it has stopped on an event it could not apply.",
                 p -> runners.get(p).failure() == null ? 1 : 0);
+        TickMetrics m = tickMetrics;
+        if (m != null) m.write(sb);
         return sb.toString();
     }
 

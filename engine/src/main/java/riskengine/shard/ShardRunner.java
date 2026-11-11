@@ -23,6 +23,22 @@ public final class ShardRunner implements Runnable {
     private volatile long appliedOffset;
     private volatile boolean stopRequested;
     private volatile Throwable failure;
+    private volatile Observer observer = e -> {};
+
+    /**
+     * Told about each event once the shard has applied it and handed every output to the sink. For
+     * measuring from outside (tick-to-margin latency, throughput): the observer may read clocks, the
+     * shard may not. Runs on the shard's thread, so it must be quick.
+     */
+    @FunctionalInterface
+    public interface Observer {
+        void applied(LoggedEvent e);
+    }
+
+    /** Set before the runner starts. */
+    public void observe(Observer o) {
+        this.observer = o;
+    }
 
     /** Receives everything the shard says, on the shard's thread, in log order. */
     @FunctionalInterface
@@ -80,6 +96,7 @@ public final class ShardRunner implements Runnable {
         for (LoggedEvent e : batch) {
             for (EngineOutput out : state.apply(e)) sink.accept(e.offset(), out);
             appliedOffset = state.nextOffset();
+            observer.applied(e);
         }
     }
 

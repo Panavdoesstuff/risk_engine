@@ -36,6 +36,7 @@ public final class ShardHost implements AutoCloseable {
     private final List<ShardRunner> runners = new ArrayList<>();
     private final List<Thread> threads = new ArrayList<>();
     private final LagMonitor lag;
+    private final TickMetrics tickMetrics;
 
     public ShardHost(String bootstrap, int partitions, MarginConfig cfg, ShardConfig shardCfg,
                      Collection<Instrument> instruments, Collection<AccountBook> books) {
@@ -57,6 +58,16 @@ public final class ShardHost implements AutoCloseable {
                     (offset, o) -> out.publish(shardId, offset, o)));
         }
         this.lag = new LagMonitor(bootstrap, eventsTopic, runners);
+        // Tick-to-margin from each tick's record timestamp (when the producer sent it) to now.
+        this.tickMetrics = new TickMetrics(partitions, (shard, tick) -> {
+            long sent = ((RedpandaEventLog) partitionLogs.get(shard)).appendedAtMillis(tick.offset());
+            return sent < 0 ? -1 : (System.currentTimeMillis() - sent) * 1_000_000L;
+        });
+        lag.include(tickMetrics);
+        for (int p = 0; p < partitions; p++) {
+            int shard = p;
+            runners.get(p).observe(e -> tickMetrics.applied(shard, e));
+        }
     }
 
     public void start() {
@@ -67,6 +78,11 @@ public final class ShardHost implements AutoCloseable {
     /** Per-shard lag, also served over HTTP by {@link LagMonitor#serve}. */
     public LagMonitor lag() {
         return lag;
+    }
+
+    /** Throughput and tick-to-margin latency, also served at /metrics. */
+    public TickMetrics tickMetrics() {
+        return tickMetrics;
     }
 
     public List<ShardRunner> runners() {

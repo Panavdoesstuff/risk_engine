@@ -299,11 +299,11 @@ Level, status and square-off episode are decided in one class. The two engines d
 - *Opens* when the level reaches SQUARE_OFF (AUTO) or when risk-ops asks (MANUAL). Episode ids count per account (E1, E2, …), so leg keys from two episodes can never collide.
 - *While open:* the level is frozen (square-off is sticky, as the build map asked in M2); user orders are refused with `SQUARING_OFF`; the account's reservations are cancelled, each with its own `RELEASED` output.
 - *Ends* RESOLVED when utilisation is back under 100% (AUTO) or the account is flat (MANUAL), and EXHAUSTED when it is still over and nothing left would free margin when closed. The check runs after every fill, so an episode ends on the fill that cures it, not on the next tick.
-- *An exhausted account is blocked* until risk-ops unblocks it (or its positions change). Otherwise it would open a new, useless episode every three ticks. *Needs a decision, see the report.*
+- *An exhausted account is blocked* until risk-ops unblocks it (or its positions change). Otherwise it would open a new, useless episode every three ticks. *Kept, by your decision after M5.*
 
 **75. The in-flight tracker: at most one leg, recorded before it is emitted.**
 `AccountRisk` holds the leg in flight (key, instrument, signed remaining quantity) and sets it in the same step that emits the `LEG` output, so the state hash never shows a leg that was sent but not recorded. No new leg is planned while one is out. Fills with the leg's key reduce what remains; the episode moves on when it reaches zero. A fill for a leg that is no longer in flight (it was rejected, then filled after all) changes the position, because the trade happened, but does not count as progress. *This is what makes "0 surplus legs while one is in flight" true by construction; the gate checks it from the outside anyway.*
-*Deviation from the map:* the map says one in-flight record per leg, which suggests several legs out at once. One at a time is slower to close a big account but can never overshoot. M6's latency numbers will show whether that matters.
+*Deviation from the map:* the map says one in-flight record per leg, which suggests several legs out at once. One at a time is slower to close a big account but can never overshoot. *Kept, by your decision after M5.*
 
 **76. Leg key = `accountId:episodeId:instrumentId:seq`. It is the order id, the outbox idempotency key and what the broker dedupes on.**
 `seq` counts legs within the episode, so a re-planned leg after a reject gets `seq + 1`: a new key, which the broker treats as a new order. However many times a leg is published (replays), stored (ON CONFLICT DO NOTHING) or sent (timeouts), it executes once.
@@ -319,7 +319,7 @@ The writers insert a leg's `orders` row (origin SQUARE_OFF, id = the leg key) an
 One relay thread sends unsent outbox rows oldest first and marks them sent on an acknowledgement.
 - *Timeout or connection error:* the order may or may not have arrived. The relay asks the broker (`GET /orders/{key}`). If it is there, the row is marked sent. If not, the row stays unsent and the next round sends it again with the same key.
 - *Broker refuses the order as malformed (4xx):* the relay writes `OrderClosed(REJECTED)` to the log so the engine releases the order or re-plans the leg.
-- *Limitation:* one relay at a time. Two would need row locking (`FOR UPDATE SKIP LOCKED`), which isn't there.
+- *Limitation:* one relay at a time. Two would need row locking (`FOR UPDATE SKIP LOCKED`), which isn't there. *(Lifted in M6, decision 88.)*
 
 **80. The mock broker misbehaves on purpose, and is idempotent on the key.**
 - 5% of requests time out. Half lose the request (the order is never created) and half lose only the answer (the order exists). That way the relay's "ask before resending" is exercised both ways.
@@ -340,7 +340,12 @@ One relay thread sends unsent outbox rows oldest first and marks them sent on an
 
 **82. The double-entry ledger books every fill that moves cash: two rows that sum to zero.**
 An option fill moves premium between the account's CASH and BROKER_CLEARING; a futures fill that closes a position moves the realised profit or loss between CASH and REALISED_PNL. The transaction id is `FILL:<broker fill id>`, so a duplicate fill can't be booked twice, and both rows go in one statement guarded by "this transaction is not booked yet", so a transaction is never half there. Postgres' deferred trigger rejects any transaction that does not sum to zero at commit. That is the gate's third check.
-*Not booked:* "margin movements". The engine never moves money when the requirement changes: required margin is a computed number, not cash set aside. There is nothing to book until we decide to model blocking margin as a transfer (CASH → MARGIN_BLOCKED). *Needs a decision, see the report.* Fills that open or add to a futures position move no cash and book nothing.
+*Not booked, by decision: margin "movements".* The ledger records money that moves, and only that. Required margin is a number the engine computes from positions and prices on every tick; no money goes anywhere when it changes. Booking it as a transfer (CASH → MARGIN_BLOCKED) would mean:
+- a ledger row pair for every account whose requirement changed, on every tick. At 100k accounts that is millions of rows an hour, describing nothing that happened;
+- a second copy of a number the engine already owns, which could drift from it;
+- a ledger that no longer answers "where did the money go?", because most of its rows would be bookkeeping about a limit.
+
+The account's requirement at any moment is in `margin_events` and the engine's state. (Your decision after M5.) Fills that open or add to a futures position move no cash and book nothing.
 
 **83. A requirement under a millionth of a rupee is zero.** *(Found by the chaos gate.)*
 The shard updates vectors incrementally. After a short option is bought back, its share of the totals can be left at 1e-10 instead of 0 until the next rolling rebuild. An account holding only long options with negative cash then read as "something required, nothing available" = infinite utilisation, and was squared off and blocked, while the reference engine, which rebuilds from positions, saw zero. Four accounts in the first chaos run did this. `MarginCalculator` now treats a requirement below ₹0.000001 as zero, and a regression test reproduces the case. Decision 38's drift check didn't catch it, because the drift was far below a paisa; what made it matter was a threshold sitting exactly at zero.
@@ -356,3 +361,66 @@ The script ran `docker compose up -d >/dev/null 2>&1 || fail "compose up"`, so i
 - The script now saves compose's output and, on any failure, prints it with the state of every container and the last 60 lines of every service's log.
 - Redpanda's health check may now take up to three minutes instead of one. A dependency that never turns healthy is what makes `up` fail, and a cold CI runner starting the broker is the likeliest one.
 If CI fails again, the log will say why.
+
+*Confirmed after M5:* the next CI run on GitHub (run #6) was green, with `m4-e2e` passing. So the cause was the broker not becoming healthy within the old one-minute window on a cold runner. The longer window is the fix.
+
+## M6 part 1: follow-ups from M5, then scale
+
+**87. Fills are stamped with replay time: the latest tick's log time.** *(Your call after M5.)*
+The fill ingester and the outbox relay write events from outside the engine, and used the wall clock: in a replay of 4 June 2024, a fill said the day the replay was run. Both now take "now" from a `ReplayClock`: a small consumer that follows partition 0 of `engine-events` (every tick goes to every partition, so one is enough) and remembers the latest tick's log time. In a live run ticks carry the live time, so it is the same thing.
+- *Granularity is one tick.* A fill between two ticks gets the earlier tick's time. With minute bars that is up to a minute early, and never later than the market data it was traded against.
+- *Before the first tick* the clock falls back to the wall clock. No fill can arrive then: with no tick there is no pre-trade check, so no accepted order.
+- *Not changed:* the API still stamps user orders with the wall clock (decision 53). *Needs a decision, see the report.*
+- The chaos test now checks that every fill and ledger row falls inside the replay's tick times.
+
+**88. Several outbox relays: each locks the rows it sends with `FOR UPDATE SKIP LOCKED`.** *(Replaces the one-relay limit in #79.)*
+Each round, in one transaction, a relay locks up to 10 unsent rows that no other relay holds, sends them, records the outcome and commits. A row is held by exactly one relay while it is being sent. A relay that dies mid-batch rolls back, and its rows go to whichever relay asks next; sending again is safe because the broker dedupes on the key. Batches are small so a slow broker keeps only a few rows away from the other relays. `outbox.sent_by` (migration V5) records which relay sent a row.
+- *Order between relays is not kept, and doesn't need to be:* a square-off never has two legs of one account waiting at once, and user orders were each checked on their own when accepted.
+- *Tested:* three relays, 3,000 rows, a well-behaved broker → 3,000 requests, each row attempted once, all three relays doing about a third. Under timeouts, every extra request is a resend of one the broker never received. The same test with the lock removed sends 7,490 requests for 3,000 rows, so it does catch the bug.
+
+**89. Tick-to-margin is measured from the tick being sent to the shard having applied it.**
+*Start:* the record's timestamp in the partition, which the producer sets when it sends the tick. *End:* the moment the shard has applied the tick: every holder repriced, every affected account's margin and level recomputed, every output handed to the `engine-out` publisher.
+- *Included:* the trip through the broker, and any time the tick waited behind other events in the partition (orders, fills).
+- *Not included:* publishing the outputs and writing them to Postgres; those are downstream and asynchronous.
+- The clock is read by an observer in the `host` package, called by the `ShardRunner` after each event. Shard code still never reads a clock (decision 40).
+- The load test uses the same end point with a finer start: `System.nanoTime()` just before the tick is handed to the producer, in the same JVM, instead of the millisecond record timestamp.
+
+**90. Metrics are served by the shard host in Prometheus' text format, without a metrics library.**
+- `risk_tick_to_margin_seconds` (histogram, per shard; buckets from 0.5 ms to 5 s, closer together around the 50 ms target)
+- `risk_ticks_applied_total` and `risk_events_applied_total` (counters, per shard; ticks/s is their rate)
+- the lag gauges from decision 68
+- GC count and time, and heap in use, to read latency spikes against
+
+Counting uses `LongAdder`, so the shard thread never waits for a scrape. A metrics library would have been one more dependency for about 120 lines.
+
+**91. Prometheus and Grafana run in compose, with the dashboard provisioned from the repo.**
+Prometheus scrapes the shard host every 2 s. Grafana's data source and the "Risk engine" dashboard are files under `monitoring/`, loaded at start and read-only in the UI, so the dashboard in the repo is the dashboard you see.
+- *Panels:* p99 against the 50 ms target, p50/p99/p99.9 over time, p99 per shard, ticks/s per shard, lag, events/s, GC and heap.
+- *Access:* anonymous viewers are allowed and the admin password defaults to `admin`. Dev only, like the JWT secret.
+- The end-to-end script checks that Prometheus has the latencies and that Grafana serves the dashboard and can query Prometheus.
+
+**92. Order traffic for the load test is written straight to the log, not through the HTTP API.**
+The quantity under test is tick-to-margin inside the shards, and what competes with ticks there is order events in the same partitions. The load test writes 1,000 user orders/s to random accounts alongside the ticks; each goes through the full pre-trade check in the shard.
+*Deviation from the map:* the map says "Gatling or k6 order traffic". An HTTP load test would measure the API, Redis and Postgres, which is a different question. With the rate limit at 10 requests/s per user, 1,000 orders/s would also need about 100 users with tokens. *Needs a decision, see the report.*
+
+**93. `replayer synth` writes synthetic live ticks at a chosen rate, carrying on from the last tick.**
+It reads the latest tick in `engine-events`, then continues: next `tick_seq`, the same spot and VIX to start from, log time advancing 1/rate seconds per tick, a small random walk. That keeps "tick_seq strictly increases", so the shards accept it after a replay. It is for driving the compose stack and the dashboard. The latency numbers come from `./gradlew :loadtest:scale`, which runs the same shard host in-process so it can time each tick exactly. Prices are made up.
+
+**94. The p99 target was missed on the first try. Profiling found two causes, one in the machine and one in the code.**
+*First run:* 100k accounts, 4 shards. p99 0.96 s at 10 ticks/s; at 50 and 100 ticks/s the shards fell behind for good (p99 41 s and 125 s). The slowest shard sustained 35 ticks/s. As agreed, profile before changing anything:
+- *GC: not it.* 7–20 collections per 60-second phase, 0.2–0.8 s in total.
+- *Boxing: not it.* No boxing frames in the profile.
+- *Allocation:* modest.
+- *A flight recording of the run:* 95% of CPU on the shard threads, half of that in the incremental update itself, about 15% in sorted-map lookups (margin parameters and "has this account's market ticked?" per account per tick), and the rest in the margin calculation.
+
+*Cause 1, the machine.* This is an Apple M4 laptop with 4 performance cores and 6 efficiency cores. During the first run another of your projects (`cfr_pokerbot`'s match runner) was using about half of it, so the shard threads ran on efficiency cores. That alone made the single-threaded benchmark 2× slower (3.4 ms against 1.64 ms per tick on a quiet machine). Every number below was taken with the machine otherwise quiet, and the run prints the system load so that can be checked.
+
+*Cause 2, memory access in the tick loop.* The update walked instrument by instrument and touched each holder's vector, so every account's vector was visited five times per tick from five places in memory. Then a second pass visited every account again for margin. At 25,000 accounts a shard that no longer fits in cache. Changed:
+- *One pass per account:* apply its holdings' changes (in instrument-id order, as before, so every sum is bit-identical: the 10,000-portfolio gate gives the same numbers to the last digit), then its rolling rebuild if it is its turn, then its margin and level, while its data is in cache.
+- *A shared slot per instrument* holding the risk arrays before and after the tick, so a holding reads them without a map lookup.
+- *Cached per account:* "every underlying I hold has ticked", cash as a double, and its holdings per underlying.
+- *Cached per vector:* its margin parameters.
+
+*Effect, same quiet machine, everything else equal* (the old engine with the new harness): shard CPU per tick went from 9.4 ms to 6.9 ms, about 25% less, and the flat-out rate from 100 to 119 ticks/s. With the old code the shards could not keep up at 100 ticks/s (p99 3.4 s, queue growing); with the new code p99 is 19.7 ms. On one thread with one shard there is no difference (4.2 ms either way for 25,000 accounts). The gain appears only when four shards compete for memory bandwidth, which is the situation that matters.
+
+*Headroom is thin.* The slowest shard sustains 119 ticks/s against a 100 ticks/s target, on four shards on a laptop with four fast cores. Two things not done yet: more shards (N is fixed for the life of a log, decision 10, so that is your call), and a leaner vector layout (all accounts' scenario losses in one flat array per shard). *See the report.*

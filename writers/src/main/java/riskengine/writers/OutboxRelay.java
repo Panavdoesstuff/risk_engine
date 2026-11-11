@@ -38,12 +38,15 @@ import riskengine.host.RedpandaLogs;
  *       the log so the engine releases the order (or re-plans the leg), and mark the row sent.</li>
  * </ul>
  *
- * One relay at a time: rows are sent in id order by a single thread, so two legs of one account can
- * never overtake each other. (Running two relays would need row locking; nothing here does that.)
+ * Any number of relays may run: each locks the rows it is sending with {@code FOR UPDATE SKIP LOCKED},
+ * so no row is sent by two relays (see {@link #run}). Order between relays is not kept, and does not need
+ * to be: a square-off never has two legs of one account waiting at once (the next leg is planned only
+ * after the previous one filled), and two user orders were each checked on their own when accepted.
  */
 public final class OutboxRelay implements Runnable, AutoCloseable {
     private final String jdbcUrl, dbUser, dbPassword, brokerUrl;
     private final RedpandaLogs log;
+    private final java.util.function.LongSupplier clock;
     private final Duration timeout;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
     private final AtomicLong sent = new AtomicLong(), requests = new AtomicLong(), timeouts = new AtomicLong(), confirmedByQuery = new AtomicLong(),
@@ -52,7 +55,8 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
     private volatile Thread thread;
 
     /** @param timeout how long to wait for the broker's answer before treating the request as lost */
-    public OutboxRelay(String jdbcUrl, String dbUser, String dbPassword, String brokerUrl, RedpandaLogs log, Duration timeout) {
+    public OutboxRelay(String jdbcUrl, String dbUser, String dbPassword, String brokerUrl, RedpandaLogs log, Duration timeout, java.util.function.LongSupplier clock) {
+        this.clock = clock;
         this.jdbcUrl = jdbcUrl;
         this.dbUser = dbUser;
         this.dbPassword = dbPassword;
@@ -63,20 +67,41 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
 
     private record Row(long id, String orderId, String key, String payload) {}
 
+    /** Rows one relay locks and sends per transaction. Small, so a slow broker holds few rows away from the other relays. */
+    static final int BATCH = 10;
+
+    private static final String LOCK_UNSENT = "SELECT id, order_id, idempotency_key, payload::text FROM outbox"
+            + " WHERE sent_at IS NULL ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED";
+
+    /**
+     * Each round: in one transaction, lock up to {@link #BATCH} unsent rows that no other relay has locked
+     * ({@code FOR UPDATE SKIP LOCKED}), send them, record the outcome, commit. A row is locked by exactly
+     * one relay while it is being sent, so running several relays never sends a row twice; a relay that
+     * dies mid-batch rolls back, and its rows go to whichever relay asks next (sending again is safe:
+     * the broker dedupes on the key).
+     */
     @Override
     public void run() {
         while (running) {
             try (Connection c = DriverManager.getConnection(jdbcUrl, dbUser, dbPassword)) {
+                c.setAutoCommit(false);
                 while (running) {
                     List<Row> rows = new ArrayList<>();
-                    try (PreparedStatement ps = c.prepareStatement(
-                            "SELECT id, order_id, idempotency_key, payload::text FROM outbox WHERE sent_at IS NULL ORDER BY id LIMIT 200");
-                         ResultSet rs = ps.executeQuery()) {
-                        while (rs.next()) rows.add(new Row(rs.getLong(1), rs.getString(2), rs.getString(3), rs.getString(4)));
+                    try (PreparedStatement ps = c.prepareStatement(LOCK_UNSENT)) {
+                        ps.setInt(1, BATCH);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) rows.add(new Row(rs.getLong(1), rs.getString(2), rs.getString(3), rs.getString(4)));
+                        }
                     }
-                    for (Row row : rows) {
-                        if (!running) break;
-                        send(c, row);
+                    try {
+                        for (Row row : rows) {
+                            if (!running) break;
+                            send(c, row);
+                        }
+                        c.commit();
+                    } catch (SQLException | RuntimeException e) {
+                        c.rollback();
+                        throw e;
                     }
                     if (rows.isEmpty()) Thread.sleep(50);
                 }
@@ -104,7 +129,7 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
                 // leg it has in flight) is released.
                 refused.incrementAndGet();
                 Map<String, String> f = FlatJson.parse(row.payload());
-                log.append(new OrderClosed(row.key(), f.get("accountId"), OrderClosed.Reason.REJECTED, System.currentTimeMillis()));
+                log.append(new OrderClosed(row.key(), f.get("accountId"), OrderClosed.Reason.REJECTED, clock.getAsLong()));
                 markSent(c, row, "refused by broker: HTTP " + r.statusCode());
                 return;
             }
@@ -134,10 +159,19 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
         }
     }
 
+    /** The relay's name, recorded on each outbox row it sends. */
+    private String name = "relay";
+
+    public OutboxRelay named(String n) {
+        this.name = n;
+        return this;
+    }
+
     private void markSent(Connection c, Row row, String note) throws SQLException {
-        try (PreparedStatement ps = c.prepareStatement("UPDATE outbox SET sent_at = now(), attempts = attempts + 1, last_error = ? WHERE id = ? AND sent_at IS NULL")) {
+        try (PreparedStatement ps = c.prepareStatement("UPDATE outbox SET sent_at = now(), attempts = attempts + 1, last_error = ?, sent_by = ? WHERE id = ? AND sent_at IS NULL")) {
             ps.setString(1, note);
-            ps.setLong(2, row.id());
+            ps.setString(2, name);
+            ps.setLong(3, row.id());
             ps.executeUpdate();
         }
         // ACCEPTED -> SENT only: if fills have already been projected the order is further along than that.
@@ -162,7 +196,7 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
     }
 
     public Thread start() {
-        Thread t = new Thread(this, "outbox-relay");
+        Thread t = new Thread(this, "outbox-" + name);
         thread = t;
         t.start();
         return t;

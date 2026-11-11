@@ -101,6 +101,13 @@ public final class ShardState {
         }
         /** Level, status and square-off episode: the state machine shared with the reference engine. */
         final AccountRisk risk;
+        // Caches for the tick loop. Derived from the fields above, so not part of the state hash.
+        int index;                       // position in byIndex, for the rolling rebuild
+        double cashDouble;               // cash as a double, kept in step with cash
+        final double collateralDouble;
+        boolean priced;                  // every underlying it holds has ticked; markets are never removed, so it stays true until it holds a new one
+        long rebuiltAtTick = Long.MIN_VALUE;
+        final TreeMap<String, Holding[]> holdingsByUnderlying = new TreeMap<>(); // rebuilt on demand after link/unlink
         AccountView view;
         MarginResult latest;
 
@@ -109,6 +116,8 @@ public final class ShardState {
             this.cash = b.cash();
             this.collateral = b.collateral();
             this.risk = new AccountRisk(b.id(), cfg.thresholds());
+            this.cashDouble = b.cash().doubleValue();
+            this.collateralDouble = b.collateral().doubleValue();
         }
     }
 
@@ -150,15 +159,23 @@ public final class ShardState {
         }
     }
 
+    /** One instrument's risk arrays before and after the current tick, shared by everyone holding it. */
+    private static final class Slot {
+        RiskArray previous;
+        RiskArray current;
+    }
+
     /** One (account, instrument) pair, with direct references so the tick loop does no lookups. */
     private static final class Holding {
         final Account account;
+        final Slot slot;
         long qty;
         double avgPrice;
         AccountVector vector; // null until the underlying has ticked
 
-        Holding(Account account, Position p, AccountVector vector) {
+        Holding(Account account, Slot slot, Position p, AccountVector vector) {
             this.account = account;
+            this.slot = slot;
             this.qty = p.qty();
             this.avgPrice = p.avgPrice().doubleValue();
             this.vector = vector;
@@ -173,6 +190,9 @@ public final class ShardState {
     /** Accounts in id order; an account's position here is its index for the rolling rebuild. */
     private final Account[] byIndex;
     private final TreeMap<String, TreeMap<String, Holding>> holders = new TreeMap<>();
+    private final TreeMap<String, Slot> slots = new TreeMap<>();
+    /** accountsByUnderlying as arrays for the tick loop; an entry is dropped whenever that map changes. */
+    private final TreeMap<String, Account[]> affectedArrays = new TreeMap<>();
     private final TreeMap<String, TreeSet<String>> byUnderlying = new TreeMap<>();
     private final TreeMap<String, TreeMap<String, Account>> accountsByUnderlying = new TreeMap<>();
     private final TreeMap<String, RiskArray> arrays = new TreeMap<>();
@@ -209,6 +229,7 @@ public final class ShardState {
             }
         }
         byIndex = accounts.values().toArray(new Account[0]);
+        for (int i = 0; i < byIndex.length; i++) byIndex[i].index = i;
     }
 
     private static SortedMap<String, AccountBook> byId(Collection<AccountBook> books) {
@@ -262,31 +283,59 @@ public final class ShardState {
 
         TreeSet<String> held = byUnderlying.get(u);
         TreeMap<String, Account> affected = accountsByUnderlying.get(u);
-        if (held != null) {
-            if (firstTick) {
-                for (String id : held) arrays.put(id, RiskArray.compute(instruments.get(id), m, grid, cfg.riskFreeRate()));
-                for (Account a : affected.values()) attachVector(a, u, rebuild(a, u));
-            } else {
-                for (String id : held) {
-                    RiskArray fresh = RiskArray.compute(instruments.get(id), m, grid, cfg.riskFreeRate());
-                    RiskArray old = arrays.put(id, fresh);
-                    // The incremental step: vector += qty x (new - old), for every holder of this instrument.
-                    for (Holding h : holders.get(id).values()) h.vector.applyTick(h.qty, old, fresh);
-                }
-            }
-        }
-        rollingRebuildAndCheck(t.tickSeq());
-
         List<EngineOutput> events = new ArrayList<>();
-        if (affected != null) {
+        if (held == null) {
+            rollingRebuildAndCheck(t.tickSeq(), false);
+            return events;
+        }
+        if (firstTick) {
+            for (String id : held) {
+                RiskArray fresh = RiskArray.compute(instruments.get(id), m, grid, cfg.riskFreeRate());
+                arrays.put(id, fresh);
+                slots.get(id).current = fresh;
+            }
+            for (Account a : affected.values()) attachVector(a, u, rebuild(a, u));
+            rollingRebuildAndCheck(t.tickSeq(), false);
             for (Account a : affected.values()) {
                 if (!fullyPriced(a)) continue;
                 MarginResult r = margin(a);
                 a.latest = r;
-                // Level, status and square-off: may emit a level change, open or end an episode, plan a leg.
                 a.risk.onTick(a.view, r, t.tickSeq(), t.logTimeMillis(), events);
             }
+            return events;
         }
+        // Reprice each held instrument once. Each holding reads old and new from its instrument's slot.
+        for (String id : held) {
+            RiskArray fresh = RiskArray.compute(instruments.get(id), m, grid, cfg.riskFreeRate());
+            Slot s = slots.get(id);
+            s.previous = arrays.put(id, fresh);
+            s.current = fresh;
+        }
+        // Then one pass over the accounts, doing everything for an account while its data is in cache:
+        // the incremental step (vector += qty x (new - old) for each of its holdings, in instrument-id
+        // order, the same order as before, so the sums are bit-identical), its rolling rebuild if it is
+        // its turn, then its margin and level. (Walking instrument by instrument instead touched every
+        // account's vector once per position, scattered over memory; at 25k accounts a shard that was
+        // most of the cost of a tick. Decision 94.)
+        int k = shardCfg.rebuildCycleTicks();
+        long due = Math.floorMod(t.tickSeq(), (long) k);
+        int rebuilt = 0;
+        for (Account a : affectedArray(u)) {
+            for (Holding h : holdingsOn(a, u)) h.vector.applyTick(h.qty, h.slot.previous, h.slot.current);
+            if (a.index % k == due) {
+                rebuildAndCheck(a, t.tickSeq());
+                a.rebuiltAtTick = t.tickSeq();
+                rebuilt++;
+            }
+            if (!fullyPriced(a)) continue;
+            MarginResult r = margin(a);
+            a.latest = r;
+            // Level, status and square-off: may emit a level change, open or end an episode, plan a leg.
+            a.risk.onTick(a.view, r, t.tickSeq(), t.logTimeMillis(), events);
+        }
+        // Accounts whose turn it is but which hold nothing on this underlying.
+        rebuilt += rollingRebuildAndCheck(t.tickSeq(), true);
+        countRebuilds(rebuilt);
         return events;
     }
 
@@ -328,6 +377,7 @@ public final class ShardState {
             h.avgPrice = now.avgPrice().doubleValue();
         }
         a.cash = a.cash.add(o.cashDelta());
+        a.cashDouble = a.cash.doubleValue();
         long orderRemaining = PositionChange.NOT_TRACKED;
         PendingOrder p = a.pending.get(f.orderId());
         if (p != null && p.instrumentId().equals(i.id())) {
@@ -459,10 +509,13 @@ public final class ShardState {
 
     private void link(Account a, Instrument i, Position p) {
         String u = i.underlying();
-        holders.computeIfAbsent(i.id(), k -> new TreeMap<>()).put(a.id, new Holding(a, p, a.vectors.get(u)));
+        Slot slot = slots.computeIfAbsent(i.id(), k -> new Slot());
+        if (slot.current == null) slot.current = arrays.get(i.id());
+        holders.computeIfAbsent(i.id(), k -> new TreeMap<>()).put(a.id, new Holding(a, slot, p, a.vectors.get(u)));
         byUnderlying.computeIfAbsent(u, k -> new TreeSet<>()).add(i.id());
-        accountsByUnderlying.computeIfAbsent(u, k -> new TreeMap<>()).put(a.id, a);
-        a.heldPerUnderlying.merge(u, 1, Integer::sum);
+        if (accountsByUnderlying.computeIfAbsent(u, k -> new TreeMap<>()).put(a.id, a) == null) affectedArrays.remove(u);
+        if (a.heldPerUnderlying.merge(u, 1, Integer::sum) == 1) a.priced = false;
+        a.holdingsByUnderlying.clear();
     }
 
     private void unlink(Account a, Instrument i) {
@@ -473,6 +526,7 @@ public final class ShardState {
             // Nobody in this shard holds it any more: stop pricing it.
             holders.remove(i.id());
             arrays.remove(i.id());
+            slots.remove(i.id());
             TreeSet<String> set = byUnderlying.get(u);
             set.remove(i.id());
             if (set.isEmpty()) byUnderlying.remove(u);
@@ -483,7 +537,32 @@ public final class ShardState {
             TreeMap<String, Account> m = accountsByUnderlying.get(u);
             m.remove(a.id);
             if (m.isEmpty()) accountsByUnderlying.remove(u);
+            affectedArrays.remove(u);
         }
+        a.holdingsByUnderlying.clear();
+    }
+
+    private Account[] affectedArray(String u) {
+        Account[] arr = affectedArrays.get(u);
+        if (arr == null) {
+            arr = accountsByUnderlying.get(u).values().toArray(new Account[0]); // account-id order
+            affectedArrays.put(u, arr);
+        }
+        return arr;
+    }
+
+    /** The account's holdings on one underlying, in instrument-id order. */
+    private Holding[] holdingsOn(Account a, String u) {
+        Holding[] hs = a.holdingsByUnderlying.get(u);
+        if (hs == null) {
+            List<Holding> list = new ArrayList<>();
+            for (String id : a.positions.keySet()) {
+                if (instruments.get(id).underlying().equals(u)) list.add(holders.get(id).get(a.id));
+            }
+            hs = list.toArray(new Holding[0]);
+            a.holdingsByUnderlying.put(u, hs);
+        }
+        return hs;
     }
 
     private void attachVector(Account a, String underlying, AccountVector v) {
@@ -496,14 +575,19 @@ public final class ShardState {
     // ---------------------------------------------------------------- margin + drift check
 
     private boolean fullyPriced(Account a) {
+        if (a.priced) return true;
         for (String u : a.heldPerUnderlying.keySet()) {
             if (!markets.containsKey(u)) return false;
         }
+        a.priced = true;
         return true;
     }
 
     private MarginResult margin(Account a) {
-        return MarginCalculator.compute(a.vectors.values(), cfg, a.cash.doubleValue(), a.collateral.doubleValue());
+        // With one underlying (Nifty only, today) skip the collection walk; the arithmetic is the same.
+        return a.vectors.size() == 1
+                ? MarginCalculator.compute(a.vectors.firstEntry().getValue(), cfg, a.cashDouble, a.collateralDouble)
+                : MarginCalculator.compute(a.vectors.values(), cfg, a.cashDouble, a.collateralDouble);
     }
 
     /** The account's vector for one underlying, rebuilt from positions and current arrays. */
@@ -520,26 +604,40 @@ public final class ShardState {
      * Rebuilds and checks the accounts whose turn it is on this tick: index % K == tick_seq % K. Which
      * accounts are rebuilt depends only on the log (tick_seq) and the shard's fixed account list, so two
      * replays of the same log rebuild the same accounts on the same ticks.
+     *
+     * @param skipDoneThisTick leave out accounts already rebuilt on this tick by the tick loop
+     * @return how many were rebuilt here
      */
-    private void rollingRebuildAndCheck(long tickSeq) {
+    private int rollingRebuildAndCheck(long tickSeq, boolean skipDoneThisTick) {
         int k = shardCfg.rebuildCycleTicks();
         int rebuilt = 0;
         for (int i = (int) Math.floorMod(tickSeq, (long) k); i < byIndex.length; i += k) {
             Account a = byIndex[i];
+            if (skipDoneThisTick && a.rebuiltAtTick == tickSeq) continue;
+            rebuildAndCheck(a, tickSeq);
             rebuilt++;
-            for (AccountVector incremental : a.vectors.values()) {
-                AccountVector full = rebuild(a, incremental.underlying());
-                double drift = incremental.maxDifference(full);
-                if (drift > maxDriftSeen) maxDriftSeen = drift;
-                if (!(drift <= shardCfg.driftToleranceRupees())) {
-                    throw new IllegalStateException("shard " + shardId + " account " + a.id + " drifted by " + drift
-                            + " rupees (tolerance " + shardCfg.driftToleranceRupees() + ") at tick " + tickSeq);
-                }
-                incremental.copyFrom(full);
-            }
         }
+        if (!skipDoneThisTick) countRebuilds(rebuilt);
+        return rebuilt;
+    }
+
+    private void countRebuilds(int rebuilt) {
         accountRebuilds += rebuilt;
         if (rebuilt > maxRebuildsInOneTick) maxRebuildsInOneTick = rebuilt;
+    }
+
+    /** One account: rebuild every vector from positions, check the incremental one is within tolerance, keep the rebuilt values. */
+    private void rebuildAndCheck(Account a, long tickSeq) {
+        for (AccountVector incremental : a.vectors.values()) {
+            AccountVector full = rebuild(a, incremental.underlying());
+            double drift = incremental.maxDifference(full);
+            if (drift > maxDriftSeen) maxDriftSeen = drift;
+            if (!(drift <= shardCfg.driftToleranceRupees())) {
+                throw new IllegalStateException("shard " + shardId + " account " + a.id + " drifted by " + drift
+                        + " rupees (tolerance " + shardCfg.driftToleranceRupees() + ") at tick " + tickSeq);
+            }
+            incremental.copyFrom(full);
+        }
     }
 
     // ---------------------------------------------------------------- state hash

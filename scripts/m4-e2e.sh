@@ -5,6 +5,7 @@
 #   POST /orders   -> Redpanda -> shard's pre-trade check -> writers -> order ACCEPTED in Postgres and in GET /orders/{id}
 #   M5: accepted orders and square-off legs -> outbox -> relay -> mock broker (full chaos) -> fills -> ledger;
 #       the synthetic fall squares accounts off; risk-ops blocks and unblocks an account over HTTP
+#   M6: synthetic live ticks at 50/s -> tick-to-margin histogram scraped by Prometheus; Grafana serves the dashboard
 #
 # It runs as its own compose project ("risk-e2e") on its own ports and volumes, so it never touches the
 # default stack or its data, and removes everything it created when it finishes.
@@ -14,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export COMPOSE_PROJECT_NAME=risk-e2e
-export POSTGRES_PORT=55432 REDPANDA_PORT=39092 REDPANDA_ADMIN_PORT=39644 REDIS_PORT=56379 API_PORT=58080 METRICS_PORT=59100 BROKER_PORT=59300
+export POSTGRES_PORT=55432 REDPANDA_PORT=39092 REDPANDA_ADMIN_PORT=39644 REDIS_PORT=56379 API_PORT=58080 METRICS_PORT=59100 BROKER_PORT=59300 PROMETHEUS_PORT=59090 GRAFANA_PORT=53000
 export BROKER_CHAOS=full
 export JWT_SECRET="e2e-only-secret-0123456789-abcdefghijklmnop"
 export DATA_DIR="$PWD/build/e2e-data"
@@ -124,6 +125,24 @@ unbalanced=$(psql -c "select count(*) from (select txn_id from ledger_entries gr
 [ "$unbalanced" = 0 ] || fail "$unbalanced unbalanced ledger transactions"
 pass "$(psql -c "select count(distinct txn_id) from ledger_entries") ledger transactions, all summing to zero; $(psql -c "select count(*) from fills") fills"
 pass "broker: $(curl -s "http://localhost:$BROKER_PORT/stats")"
+
+echo "== monitoring: synthetic live ticks -> Prometheus -> Grafana"
+synth=$($R synth --redpanda "localhost:$REDPANDA_PORT" --rate 50 --seconds 10)
+pass "$synth"
+promq() { curl -s --get "http://localhost:$PROMETHEUS_PORT/api/v1/query" --data-urlencode "query=$1" | sed -E 's/.*"value":\[[^,]+,"([^"]+)".*/\1/'; }
+scraped() { promq 'sum(risk_tick_to_margin_seconds_count)' | awk '{exit !($1 >= 2000)}'; }
+wait_for "Prometheus to have scraped the tick latencies" scraped
+sleep 4
+p50=$(promq 'histogram_quantile(0.5, sum by (le) (rate(risk_tick_to_margin_seconds_bucket[1m])))')
+p99=$(promq 'histogram_quantile(0.99, sum by (le) (rate(risk_tick_to_margin_seconds_bucket[1m])))')
+tps=$(promq 'min(rate(risk_ticks_applied_total[30s]))')
+echo "$p99" | grep -Eq '^[0-9.e+-]+$' || fail "Prometheus has no p99: $p99"
+pass "Prometheus (the dashboard's own queries): p50 $p50 s, p99 $p99 s, slowest shard $tps ticks/s"
+dash=$(curl -s "http://localhost:$GRAFANA_PORT/api/dashboards/uid/risk-engine")
+echo "$dash" | grep -q '"title":"Risk engine"' || fail "Grafana has no Risk engine dashboard: $(echo "$dash" | head -c 300)"
+ds=$(curl -s "http://localhost:$GRAFANA_PORT/api/datasources/proxy/uid/prometheus/api/v1/query?query=risk_shard_up")
+echo "$ds" | grep -q '"status":"success"' || fail "Grafana cannot query Prometheus: $(echo "$ds" | head -c 300)"
+pass "Grafana serves the Risk engine dashboard ($(echo "$dash" | grep -o '"type":"timeseries"' | wc -l | tr -d ' ') charts) and queries Prometheus through its data source"
 
 echo "== risk-ops over real HTTP"
 ops=$(./gradlew -q :api:devToken --args="risk-ops e2e-ops" | tail -1)

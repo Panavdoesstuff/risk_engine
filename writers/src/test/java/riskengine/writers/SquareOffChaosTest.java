@@ -159,9 +159,10 @@ class SquareOffChaosTest {
         MockBroker.Chaos chaos = new MockBroker.Chaos(0.05, 0.02, 0.10, 120, 450, 20240604L);
         long started = System.nanoTime();
         try (RedpandaLogs log = new RedpandaLogs(bootstrap, Topics.ENGINE_EVENTS, N, Duration.ofMillis(100));
-             FillIngester ingester = new FillIngester(0, jdbc, user, password, log).start();
+             riskengine.host.ReplayClock clock = new riskengine.host.ReplayClock(bootstrap, Topics.ENGINE_EVENTS);
+             FillIngester ingester = new FillIngester(0, jdbc, user, password, log, clock).start();
              MockBroker broker = new MockBroker(chaos, "http://localhost:" + ingester.port() + "/broker/callbacks", 0).start();
-             OutboxRelay relay = new OutboxRelay(jdbc, user, password, "http://localhost:" + broker.port(), log, Duration.ofMillis(200));
+             OutboxRelay relay = new OutboxRelay(jdbc, user, password, "http://localhost:" + broker.port(), log, Duration.ofMillis(200), clock);
              EngineOutWriter writer = new EngineOutWriter(bootstrap, Topics.ENGINE_OUT, jdbc, user, password);
              ShardHost host = new ShardHost(bootstrap, N, Fixtures.CFG, ShardConfig.defaults(), instruments, books)) {
             writer.start();
@@ -289,6 +290,11 @@ class SquareOffChaosTest {
             long duplicatesDropped = shards.stream().mapToLong(ShardState::duplicateFills).sum();
             assertEquals(b.get("duplicateCallbacks"), duplicatesDropped, "every duplicate callback was ignored by a shard");
             assertEquals(positionChanges, count("SELECT count(*) FROM fills"), "one fills row per fill the engine applied");
+            // Fills carry replay time (the ticks' 2024 clock), not the day the test ran.
+            long firstTick = Fixtures.T0 + 60_000L, lastTick = Fixtures.T0 + TICKS * 60_000L;
+            assertEquals(0, count("SELECT count(*) FROM fills WHERE filled_at < to_timestamp(" + firstTick / 1000.0 + ") OR filled_at > to_timestamp(" + lastTick / 1000.0 + ")"),
+                    "every fill is stamped with a tick's log time");
+            assertEquals(0, count("SELECT count(*) FROM ledger_entries WHERE log_time > to_timestamp(" + lastTick / 1000.0 + ")"));
 
             // ------------------------------------------------------------ GATE 3: the ledger
             long unbalanced = count("SELECT count(*) FROM (SELECT txn_id FROM ledger_entries GROUP BY txn_id HAVING sum(amount) <> 0 OR count(*) <> 2) t");
