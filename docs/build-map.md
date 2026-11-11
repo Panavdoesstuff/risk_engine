@@ -145,15 +145,15 @@ Start `docs/decisions.md` on day one. Write one short entry every time you choos
 
 ### M6 — Scale and recovery (go/no-go)
 
-> **Part 1 (scale) done** (decisions.md #87–#94); **part 2 (snapshots, recovery, kill -9) to do.** Also done here, as follow-ups approved after M5: fills stamped with replay time, several outbox relays with `FOR UPDATE SKIP LOCKED`.
+> **Part 1 (scale) and part 2 (recovery) done** (decisions.md #87–#106). *Caveat on the p99 gate, decision 105:* held at 50 ticks/s; at 100 ticks/s hit or miss on the development laptop. Also done here, as follow-ups approved after M5: fills stamped with replay time, several outbox relays with `FOR UPDATE SKIP LOCKED`.
 
 - [x] Synthetic tick generator at 10, 50, 100 ticks/s *(`./gradlew :loadtest:scale` measures; `replayer synth` drives the compose stack)*
 - [x] Gatling or k6 order traffic in parallel *(1,000 orders/s written to the log, not over HTTP: #92)*
 - [x] 100k accounts, ~5 positions each
 - [x] Prometheus metrics: tick-to-margin latency histogram, per-shard lag, ticks/s; Grafana dashboard
-- [ ] Snapshots every M seconds of **log time**: state, partition offset, state hash
-- [ ] Recovery: load snapshot, replay from offset; re-emitted square-offs carry same keys and are dropped by the unique constraint
-- [ ] `kill -9` script mid-run; compare final hash with uninterrupted run; count broker calls
+- [x] Snapshots every M seconds of **log time**: state, partition offset, state hash *(checksum, and a byte-for-byte re-snapshot check on restore instead of a stored hash)*
+- [x] Recovery: load snapshot, replay from offset; re-emitted square-offs carry same keys and are dropped by the unique constraint
+- [x] `kill -9` script mid-run; compare final hash with uninterrupted run; count broker calls *(`ShardKillTest`, and kill -9 of the shard host in `scripts/m4-e2e.sh`)*
 
 **Gate:** p99 < 50 ms at 100k accounts with sustained ticks/s published; recovery hash identical; 0 duplicate broker orders. If p99 fails, profile (allocation in hot path, boxing, GC) before going further.
 

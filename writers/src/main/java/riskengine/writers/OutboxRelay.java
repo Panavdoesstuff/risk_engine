@@ -93,16 +93,21 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
                             while (rs.next()) rows.add(new Row(rs.getLong(1), rs.getString(2), rs.getString(3), rs.getString(4)));
                         }
                     }
+                    List<Row> sentNow = new ArrayList<>();
                     try {
                         for (Row row : rows) {
                             if (!running) break;
-                            send(c, row);
+                            if (send(c, row)) sentNow.add(row);
                         }
                         c.commit();
                     } catch (SQLException | RuntimeException e) {
                         c.rollback();
                         throw e;
                     }
+                    // Only now, outside the locked batch, move the orders on to SENT: one row per transaction,
+                    // so the relay never holds two order rows at once and can never deadlock with a writer
+                    // updating the same orders to FILLED in another order (decision 103).
+                    for (Row row : sentNow) markOrderSent(c, row);
                     if (rows.isEmpty()) Thread.sleep(50);
                 }
             } catch (SQLException e) {
@@ -114,7 +119,8 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
         }
     }
 
-    private void send(Connection c, Row row) throws SQLException, InterruptedException {
+    /** @return true if the row is now marked sent */
+    private boolean send(Connection c, Row row) throws SQLException, InterruptedException {
         requests.incrementAndGet();
         String problem;
         try {
@@ -122,7 +128,7 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
                     .header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(row.payload())).build(), HttpResponse.BodyHandlers.ofString());
             if (r.statusCode() / 100 == 2) {
                 markSent(c, row, null);
-                return;
+                return true;
             }
             if (r.statusCode() / 100 == 4) {
                 // The broker will never take this order. Tell the engine, so the margin it reserved (or the
@@ -131,7 +137,7 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
                 Map<String, String> f = FlatJson.parse(row.payload());
                 log.append(new OrderClosed(row.key(), f.get("accountId"), OrderClosed.Reason.REJECTED, clock.getAsLong()));
                 markSent(c, row, "refused by broker: HTTP " + r.statusCode());
-                return;
+                return true;
             }
             problem = "HTTP " + r.statusCode();
         } catch (IOException e) {
@@ -145,7 +151,7 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
             if (q.statusCode() == 200) {
                 confirmedByQuery.incrementAndGet();
                 markSent(c, row, "sent; answer lost (" + problem + "), confirmed by query");
-                return;
+                return true;
             }
             if (q.statusCode() == 404) notFoundAfterTimeout.incrementAndGet();
             problem += q.statusCode() == 404 ? "; broker does not have it" : "; query answered HTTP " + q.statusCode();
@@ -157,6 +163,7 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
             ps.setLong(2, row.id());
             ps.executeUpdate();
         }
+        return false;
     }
 
     /** The relay's name, recorded on each outbox row it sends. */
@@ -174,16 +181,21 @@ public final class OutboxRelay implements Runnable, AutoCloseable {
             ps.setLong(3, row.id());
             ps.executeUpdate();
         }
-        // ACCEPTED -> SENT only: if fills have already been projected the order is further along than that.
+        sent.incrementAndGet();
+    }
+
+    /** ACCEPTED -> SENT, PLANNED -> SENT: each its own short transaction. A later status (FILLED, ...) is left alone. */
+    private void markOrderSent(Connection c, Row row) throws SQLException {
         try (PreparedStatement ps = c.prepareStatement("UPDATE orders SET status = 'SENT', updated_at = now() WHERE id = ? AND status = 'ACCEPTED'")) {
             ps.setString(1, row.orderId());
             ps.executeUpdate();
         }
+        c.commit();
         try (PreparedStatement ps = c.prepareStatement("UPDATE square_off_legs SET status = 'SENT', updated_at = now() WHERE leg_key = ? AND status = 'PLANNED'")) {
             ps.setString(1, row.key());
             ps.executeUpdate();
         }
-        sent.incrementAndGet();
+        c.commit();
     }
 
     private void pause(long millis) {

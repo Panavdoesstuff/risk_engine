@@ -46,7 +46,8 @@ public final class LagMonitor implements AutoCloseable {
 
     public LagMonitor(String bootstrap, String eventsTopic, List<ShardRunner> runners) {
         this.runners = List.copyOf(runners);
-        for (int p = 0; p < runners.size(); p++) partitions.add(new TopicPartition(eventsTopic, p));
+        // Runner i reads partition runners.get(i).state().shardId(): a host may run only some shards.
+        for (ShardRunner r : runners) partitions.add(new TopicPartition(eventsTopic, r.state().shardId()));
         this.endOffsets = new AtomicLongArray(runners.size());
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
@@ -103,7 +104,7 @@ public final class LagMonitor implements AutoCloseable {
     private void gauge(StringBuilder sb, String name, String help, java.util.function.IntToLongFunction value) {
         sb.append("# HELP ").append(name).append(' ').append(help).append('\n');
         sb.append("# TYPE ").append(name).append(" gauge\n");
-        for (int p = 0; p < runners.size(); p++) sb.append(name).append("{shard=\"").append(p).append("\"} ").append(value.applyAsLong(p)).append('\n');
+        for (int p = 0; p < runners.size(); p++) sb.append(name).append("{shard=\"").append(runners.get(p).state().shardId()).append("\"} ").append(value.applyAsLong(p)).append('\n');
     }
 
     /** Serves /metrics and /healthz. Port 0 picks a free port; the port in use is returned. */

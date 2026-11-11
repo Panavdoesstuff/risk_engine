@@ -30,7 +30,11 @@ class EventLogTest {
         Event order = new OrderRequest("O-1", "A0000001", "NIFTY-20240613-23000-CE", OrderRequest.Side.SELL, 50, OrderRequest.Origin.USER, 111);
         Event fill = new Fill("BF-9", "O-1", "A0000001", "NIFTY-20240613-23000-CE", -50, new BigDecimal("266.70"), 222);
         Event sq = new SquareOffResult("A0000001:E1:NIFTY-20240613-23000-CE:0", "A0000001", "NIFTY-20240613-23000-CE", SquareOffResult.Status.REJECTED, 333);
-        assertEquals("ORDER|v1|O-1|A0000001|NIFTY-20240613-23000-CE|SELL|50|USER|111", EventCodec.encode(order));
+        assertEquals("ORDER|v2|O-1|A0000001|NIFTY-20240613-23000-CE|SELL|50|USER|111|-1", EventCodec.encode(order));
+        assertEquals(order, EventCodec.decode("ORDER|v1|O-1|A0000001|NIFTY-20240613-23000-CE|SELL|50|USER|111"), "lines written before v2 still read");
+        Event received = new OrderRequest("O-2", "A0000001", "NIFTY-20240613-23000-CE", OrderRequest.Side.BUY, 25, OrderRequest.Origin.USER, 111, 1_799_000_000_123L);
+        assertEquals("ORDER|v2|O-2|A0000001|NIFTY-20240613-23000-CE|BUY|25|USER|111|1799000000123", EventCodec.encode(received));
+        assertEquals(received, EventCodec.decode(EventCodec.encode(received)));
         assertEquals("FILL|v1|BF-9|O-1|A0000001|NIFTY-20240613-23000-CE|-50|266.70|222", EventCodec.encode(fill));
         assertEquals("SQOFF|v1|A0000001:E1:NIFTY-20240613-23000-CE:0|A0000001|NIFTY-20240613-23000-CE|REJECTED|333", EventCodec.encode(sq));
         Event closed = new OrderClosed("O-1", "A0000001", OrderClosed.Reason.CANCELLED, 444);

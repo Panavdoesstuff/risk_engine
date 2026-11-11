@@ -186,6 +186,8 @@ public final class ShardState {
     private final MarginConfig cfg;
     private final ShardConfig shardCfg;
     private final SortedMap<String, Instrument> instruments = new TreeMap<>();
+    /** Instrument ids in order, fixed at construction: the snapshot's instrument table. */
+    private final String[] instrumentIds;
     private final TreeMap<String, Account> accounts = new TreeMap<>();
     /** Accounts in id order; an account's position here is its index for the rolling rebuild. */
     private final Account[] byIndex;
@@ -229,6 +231,7 @@ public final class ShardState {
             }
         }
         byIndex = accounts.values().toArray(new Account[0]);
+        instrumentIds = this.instruments.keySet().toArray(new String[0]);
         for (int i = 0; i < byIndex.length; i++) byIndex[i].index = i;
     }
 
@@ -638,6 +641,444 @@ public final class ShardState {
             }
             incremental.copyFrom(full);
         }
+    }
+
+    // ---------------------------------------------------------------- snapshots
+
+    private static final String SNAPSHOT_MAGIC = "RISK-SHARD-SNAPSHOT";
+    private static final int SNAPSHOT_VERSION = 2; // 2: decimals as unscaled long + scale
+    private static final int CHECKSUM_BYTES = 32;
+
+    /** A snapshot could not be used. The caller falls back to an older one, or to replaying from offset 0. */
+    public static final class SnapshotException extends Exception {
+        private static final long serialVersionUID = 1L;
+
+        public SnapshotException(String message) {
+            super(message);
+        }
+
+        public SnapshotException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    /** What a snapshot's header says, readable without restoring it. */
+    public record SnapshotInfo(int shardId, long nextOffset, long lastTickSeq, long logTimeMillis) {}
+
+    /**
+     * The whole state as bytes, at the current point in the log. Must be called on the shard's own
+     * thread, between events (the shard host does it right after applying a tick).
+     *
+     * <p>Everything is written in a fixed order (all collections are sorted), so the same state always
+     * gives the same bytes. Doubles are written by their exact bits and decimals as their exact text, so a
+     * restored shard has the same state hash, bit for bit. Risk arrays are not written: they are
+     * recomputed from the markets on restore, which gives the same bits (StrictMath). Instruments are
+     * written once, in a table, and referred to by number. The last 32 bytes are SHA-256 of everything
+     * before them.
+     *
+     * <p>This is {@link #snapshotBody()} plus {@link #withChecksum}; the shard host calls the first on the
+     * shard's thread and leaves the checksum to its background writer.
+     */
+    public byte[] snapshot() {
+        return withChecksum(snapshotBody());
+    }
+
+    /** A growable byte buffer without ByteArrayOutputStream's per-write locking (snapshots make millions of small writes). */
+    private static final class ByteSink extends java.io.OutputStream {
+        private byte[] buf;
+        private int size;
+
+        ByteSink(int initial) {
+            buf = new byte[Math.max(64, initial)];
+        }
+
+        private void ensure(int more) {
+            if (size + more > buf.length) buf = java.util.Arrays.copyOf(buf, Math.max(buf.length * 2, size + more));
+        }
+
+        @Override
+        public void write(int b) {
+            ensure(1);
+            buf[size++] = (byte) b;
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) {
+            ensure(len);
+            System.arraycopy(b, off, buf, size, len);
+            size += len;
+        }
+
+        byte[] toByteArray() {
+            return java.util.Arrays.copyOf(buf, size);
+        }
+    }
+
+    /**
+     * A decimal, exactly (value and scale): as a long unscaled value plus the scale when it fits, which is
+     * always for money and prices here, else as text. Either way it reads back equal, scale included.
+     */
+    private static void writeDecimal(java.io.DataOutputStream out, BigDecimal d) throws java.io.IOException {
+        java.math.BigInteger unscaled = d.unscaledValue();
+        if (unscaled.bitLength() < 64) {
+            out.writeByte(0);
+            out.writeLong(unscaled.longValue());
+            out.writeInt(d.scale());
+        } else {
+            out.writeByte(1);
+            out.writeUTF(d.toString());
+        }
+    }
+
+    private static BigDecimal readDecimal(java.io.DataInputStream in) throws java.io.IOException {
+        return in.readByte() == 0 ? BigDecimal.valueOf(in.readLong(), in.readInt()) : new BigDecimal(in.readUTF());
+    }
+
+    /** Appends the SHA-256 of {@code body}. Safe on any thread: the body is a plain byte array. */
+    public static byte[] withChecksum(byte[] body) {
+        try {
+            byte[] all = java.util.Arrays.copyOf(body, body.length + CHECKSUM_BYTES);
+            System.arraycopy(MessageDigest.getInstance("SHA-256").digest(body), 0, all, body.length, CHECKSUM_BYTES);
+            return all;
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * The snapshot without its checksum: the only part that has to run on the shard's thread. (No state
+     * hash either: restoring checks itself by snapshotting the restored state again and comparing bytes,
+     * which is a stronger check than a hash and costs nothing here.)
+     */
+    public byte[] snapshotBody() {
+        return capture().serialize();
+    }
+
+    /**
+     * A point-in-time copy of everything a snapshot holds, cheap enough to take on the shard's thread
+     * between events: positions, cash, reservations, margin results and markets are immutable objects, so
+     * only references are copied; vectors are copied as their 21 numbers; the risk state machine is
+     * copied field by field. Turning it into bytes ({@link SnapshotImage#serialize}) can then happen on
+     * any thread while the shard carries on.
+     */
+    public SnapshotImage capture() {
+        AccountImage[] images = new AccountImage[accounts.size()];
+        int i = 0;
+        for (Account a : accounts.values()) {
+            String[] posIds = a.positions.keySet().toArray(new String[0]);
+            Position[] pos = a.positions.values().toArray(new Position[0]);
+            String[] vecU = new String[a.vectors.size()];
+            double[][] vecC = new double[a.vectors.size()][];
+            int v = 0;
+            for (AccountVector vec : a.vectors.values()) {
+                vecU[v] = vec.underlying();
+                vecC[v++] = vec.components();
+            }
+            String[] pendIds = a.pending.keySet().toArray(new String[0]);
+            PendingOrder[] pend = a.pending.values().toArray(new PendingOrder[0]);
+            images[i++] = new AccountImage(a.id, a.cash, a.collateral, posIds, pos, vecU, vecC, pendIds, pend, a.risk.copy(), a.latest);
+        }
+        return new SnapshotImage(shardId, nextOffset, lastTickSeq, latestLogTime(), cfg.fingerprint(), shardCfg.rebuildCycleTicks(),
+                shardCfg.driftToleranceRupees(), instrumentIds, markets.values().toArray(new MarketState[0]), images,
+                seenFillIds.toArray(new String[0]), seenOrderIds.toArray(new String[0]),
+                maxDriftSeen, accountRebuilds, maxRebuildsInOneTick, duplicateFills, duplicateOrders);
+    }
+
+    private record AccountImage(String id, BigDecimal cash, BigDecimal collateral, String[] positionIds, Position[] positions,
+                                String[] vectorUnderlyings, double[][] vectorComponents, String[] pendingIds, PendingOrder[] pending,
+                                AccountRisk risk, MarginResult latest) {}
+
+    /** What {@link #capture()} returns. Immutable; {@link #serialize()} may run on any thread, any number of times. */
+    public static final class SnapshotImage {
+        private final int shardId, k, maxRebuildsInOneTick;
+        private final long nextOffset, lastTickSeq, logTime, accountRebuilds, duplicateFills, duplicateOrders;
+        private final String fingerprint;
+        private final double tolerance, maxDriftSeen;
+        private final String[] instrumentIds, seenFills, seenOrders;
+        private final MarketState[] markets;
+        private final AccountImage[] accounts;
+
+        SnapshotImage(int shardId, long nextOffset, long lastTickSeq, long logTime, String fingerprint, int k, double tolerance, String[] instrumentIds,
+                      MarketState[] markets, AccountImage[] accounts, String[] seenFills, String[] seenOrders, double maxDriftSeen, long accountRebuilds,
+                      int maxRebuildsInOneTick, long duplicateFills, long duplicateOrders) {
+            this.shardId = shardId;
+            this.nextOffset = nextOffset;
+            this.lastTickSeq = lastTickSeq;
+            this.logTime = logTime;
+            this.fingerprint = fingerprint;
+            this.k = k;
+            this.tolerance = tolerance;
+            this.instrumentIds = instrumentIds;
+            this.markets = markets;
+            this.accounts = accounts;
+            this.seenFills = seenFills;
+            this.seenOrders = seenOrders;
+            this.maxDriftSeen = maxDriftSeen;
+            this.accountRebuilds = accountRebuilds;
+            this.maxRebuildsInOneTick = maxRebuildsInOneTick;
+            this.duplicateFills = duplicateFills;
+            this.duplicateOrders = duplicateOrders;
+        }
+
+        public int shardId() {
+            return shardId;
+        }
+
+        public long nextOffset() {
+            return nextOffset;
+        }
+
+        /** The snapshot body (no checksum): the same bytes the shard would have written at capture time. */
+        public byte[] serialize() {
+            try {
+                ByteSink bytes = new ByteSink(64 + accounts.length * 480);
+                java.io.DataOutputStream out = new java.io.DataOutputStream(bytes);
+                out.writeUTF(SNAPSHOT_MAGIC);
+                out.writeInt(SNAPSHOT_VERSION);
+                out.writeInt(shardId);
+                out.writeLong(nextOffset);
+                out.writeLong(lastTickSeq);
+                out.writeLong(logTime);
+                out.writeUTF(fingerprint);
+                out.writeInt(k);
+                out.writeDouble(tolerance);
+
+                TreeMap<String, Integer> index = new TreeMap<>();
+                out.writeInt(instrumentIds.length);
+                for (String id : instrumentIds) {
+                    index.put(id, index.size());
+                    out.writeUTF(id);
+                }
+                out.writeInt(markets.length);
+                for (MarketState m : markets) {
+                    out.writeUTF(m.underlying());
+                    out.writeDouble(m.spot());
+                    out.writeDouble(m.vol());
+                    out.writeLong(m.logTimeMillis());
+                }
+                out.writeInt(accounts.length);
+                for (AccountImage a : accounts) {
+                    out.writeUTF(a.id());
+                    writeDecimal(out, a.cash());
+                    writeDecimal(out, a.collateral());
+                    out.writeInt(a.positions().length);
+                    for (int i = 0; i < a.positions().length; i++) {
+                        out.writeInt(index.get(a.positionIds()[i]));
+                        out.writeLong(a.positions()[i].qty());
+                        writeDecimal(out, a.positions()[i].avgPrice());
+                    }
+                    out.writeInt(a.vectorUnderlyings().length);
+                    for (int i = 0; i < a.vectorUnderlyings().length; i++) {
+                        out.writeUTF(a.vectorUnderlyings()[i]);
+                        for (double c : a.vectorComponents()[i]) out.writeDouble(c);
+                    }
+                    out.writeInt(a.pending().length);
+                    for (int i = 0; i < a.pending().length; i++) {
+                        out.writeUTF(a.pendingIds()[i]);
+                        out.writeInt(index.get(a.pending()[i].instrumentId()));
+                        out.writeLong(a.pending()[i].remaining());
+                    }
+                    a.risk().writeTo(out);
+                    MarginResult r = a.latest();
+                    out.writeBoolean(r != null);
+                    if (r != null) {
+                        out.writeDouble(r.worstScenarioLoss());
+                        out.writeInt(r.worstScenario());
+                        out.writeDouble(r.shortOptionMinimum());
+                        out.writeDouble(r.spanRequirement());
+                        out.writeDouble(r.netOptionValue());
+                        out.writeDouble(r.riskRequirement());
+                        out.writeDouble(r.exposureMargin());
+                        out.writeDouble(r.required());
+                        out.writeDouble(r.futuresMtm());
+                        out.writeDouble(r.available());
+                        out.writeDouble(r.utilisation());
+                    }
+                }
+                out.writeInt(seenFills.length);
+                for (String id : seenFills) out.writeUTF(id);
+                out.writeInt(seenOrders.length);
+                for (String id : seenOrders) out.writeUTF(id);
+                out.writeDouble(maxDriftSeen);
+                out.writeLong(accountRebuilds);
+                out.writeInt(maxRebuildsInOneTick);
+                out.writeLong(duplicateFills);
+                out.writeLong(duplicateOrders);
+                out.flush();
+                return bytes.toByteArray();
+            } catch (java.io.IOException e) {
+                throw new IllegalStateException("cannot write snapshot", e);
+            }
+        }
+    }
+
+    /** Log time of the latest tick on any underlying; Long.MIN_VALUE before the first tick. */
+    public long latestTickLogTime() {
+        return latestLogTime();
+    }
+
+    private long latestLogTime() {
+        long t = Long.MIN_VALUE;
+        for (MarketState m : markets.values()) t = Math.max(t, m.logTimeMillis());
+        return t;
+    }
+
+    /** Reads a snapshot's header after checking its checksum. */
+    public static SnapshotInfo snapshotInfo(byte[] snapshot) throws SnapshotException {
+        // (a header-only read: the full checks happen in restore)
+        try {
+            java.io.DataInputStream in = verified(snapshot);
+            return new SnapshotInfo(in.readInt(), in.readLong(), in.readLong(), in.readLong());
+        } catch (java.io.IOException e) {
+            throw new SnapshotException("unreadable snapshot header", e);
+        }
+    }
+
+    private static java.io.DataInputStream verified(byte[] snapshot) throws SnapshotException, java.io.IOException {
+        if (snapshot.length < CHECKSUM_BYTES + 8) throw new SnapshotException("too short to be a snapshot (" + snapshot.length + " bytes)");
+        int bodyLength = snapshot.length - CHECKSUM_BYTES;
+        byte[] expected;
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            md.update(snapshot, 0, bodyLength);
+            expected = md.digest();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+        if (!MessageDigest.isEqual(expected, java.util.Arrays.copyOfRange(snapshot, bodyLength, snapshot.length))) {
+            throw new SnapshotException("checksum does not match: the snapshot is damaged or incomplete");
+        }
+        java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(snapshot, 0, bodyLength));
+        if (!SNAPSHOT_MAGIC.equals(in.readUTF())) throw new SnapshotException("not a shard snapshot");
+        int version = in.readInt();
+        if (version != SNAPSHOT_VERSION) throw new SnapshotException("snapshot version " + version + ", this engine reads " + SNAPSHOT_VERSION);
+        return in;
+    }
+
+    /**
+     * Rebuilds a shard from a snapshot. Refuses (SnapshotException) unless the checksum matches, the
+     * snapshot was taken with the same margin config and drift-check settings, it holds exactly the
+     * accounts this shard owns, every instrument it mentions is known, and the restored state, snapshotted
+     * again, gives exactly the same bytes (so every field came back exactly as it was written).
+     *
+     * @param books the accounts this shard owns now; only their ids are used, the rest comes from the snapshot
+     */
+    public static ShardState restore(byte[] snapshot, MarginConfig cfg, ShardConfig shardCfg, Collection<Instrument> instruments,
+                                     Collection<AccountBook> books) throws SnapshotException {
+        try {
+            java.io.DataInputStream in = verified(snapshot);
+            int shardId = in.readInt();
+            long nextOffset = in.readLong(), lastTickSeq = in.readLong();
+            in.readLong(); // log time: header only
+            String fingerprint = in.readUTF();
+            if (!fingerprint.equals(cfg.fingerprint())) throw new SnapshotException("taken with a different margin config");
+            int k = in.readInt();
+            double tolerance = in.readDouble();
+            if (k != shardCfg.rebuildCycleTicks() || tolerance != shardCfg.driftToleranceRupees()) {
+                throw new SnapshotException("taken with different drift-check settings (K " + k + ", tolerance " + tolerance + ")");
+            }
+            TreeMap<String, Instrument> known = new TreeMap<>();
+            for (Instrument i : instruments) known.put(i.id(), i);
+            int n = in.readInt();
+            String[] ids = new String[n];
+            for (int i = 0; i < n; i++) ids[i] = in.readUTF();
+            TreeMap<String, MarketState> markets = new TreeMap<>();
+            int marketCount = in.readInt();
+            for (int i = 0; i < marketCount; i++) {
+                MarketState m = new MarketState(in.readUTF(), in.readDouble(), in.readDouble(), in.readLong());
+                markets.put(m.underlying(), m);
+            }
+            record Rest(TreeMap<String, double[]> vectors, TreeMap<String, PendingOrder> pending, byte[] risk, MarginResult latest) {}
+            List<AccountBook> snapBooks = new ArrayList<>();
+            TreeMap<String, Rest> rest = new TreeMap<>();
+            int accountCount = in.readInt();
+            for (int a = 0; a < accountCount; a++) {
+                String id = in.readUTF();
+                BigDecimal cash = readDecimal(in), collateral = readDecimal(in);
+                TreeMap<String, Position> positions = new TreeMap<>();
+                int pc = in.readInt();
+                for (int i = 0; i < pc; i++) {
+                    String instrument = instrumentId(ids, in.readInt(), known);
+                    long qty = in.readLong();
+                    positions.put(instrument, new Position(qty, readDecimal(in)));
+                }
+                TreeMap<String, double[]> vectors = new TreeMap<>();
+                int vc = in.readInt();
+                for (int i = 0; i < vc; i++) {
+                    String u = in.readUTF();
+                    double[] c = new double[AccountVector.COMPONENTS];
+                    for (int j = 0; j < c.length; j++) c[j] = in.readDouble();
+                    vectors.put(u, c);
+                }
+                TreeMap<String, PendingOrder> pending = new TreeMap<>();
+                int oc = in.readInt();
+                for (int i = 0; i < oc; i++) {
+                    String orderId = in.readUTF();
+                    pending.put(orderId, new PendingOrder(instrumentId(ids, in.readInt(), known), in.readLong()));
+                }
+                // The risk state is read now (to move past it) and applied once the account exists.
+                java.io.ByteArrayOutputStream riskBytes = new java.io.ByteArrayOutputStream();
+                AccountRisk scratch = new AccountRisk(id, cfg.thresholds());
+                scratch.readFrom(in);
+                scratch.writeTo(new java.io.DataOutputStream(riskBytes));
+                MarginResult latest = in.readBoolean()
+                        ? new MarginResult(in.readDouble(), in.readInt(), in.readDouble(), in.readDouble(), in.readDouble(), in.readDouble(),
+                                in.readDouble(), in.readDouble(), in.readDouble(), in.readDouble(), in.readDouble())
+                        : null;
+                snapBooks.add(new AccountBook(id, cash, collateral, positions));
+                rest.put(id, new Rest(vectors, pending, riskBytes.toByteArray(), latest));
+            }
+            TreeSet<String> owned = new TreeSet<>();
+            for (AccountBook b : books) owned.add(b.id());
+            if (!owned.equals(rest.navigableKeySet())) {
+                throw new SnapshotException("holds " + rest.size() + " accounts, but this shard owns " + owned.size() + " others: the book has changed");
+            }
+
+            ShardState s = new ShardState(shardId, cfg, shardCfg, instruments, snapBooks); // positions are linked here
+            s.markets.putAll(markets);
+            for (var held : s.byUnderlying.entrySet()) {
+                MarketState m = s.markets.get(held.getKey());
+                if (m == null) continue;
+                for (String id : held.getValue()) {
+                    RiskArray array = RiskArray.compute(s.instruments.get(id), m, s.grids.get(held.getKey()), cfg.riskFreeRate());
+                    s.arrays.put(id, array);
+                    s.slots.get(id).current = array;
+                }
+            }
+            for (Account a : s.accounts.values()) {
+                Rest r = rest.get(a.id);
+                for (var v : r.vectors().entrySet()) s.attachVector(a, v.getKey(), AccountVector.of(v.getKey(), v.getValue()));
+                for (var p : r.pending().entrySet()) a.reserve(p.getKey(), p.getValue());
+                a.risk.readFrom(new java.io.DataInputStream(new java.io.ByteArrayInputStream(r.risk())));
+                a.latest = r.latest();
+            }
+            int fills = in.readInt();
+            for (int i = 0; i < fills; i++) s.seenFillIds.add(in.readUTF());
+            int orders = in.readInt();
+            for (int i = 0; i < orders; i++) s.seenOrderIds.add(in.readUTF());
+            s.maxDriftSeen = in.readDouble();
+            s.accountRebuilds = in.readLong();
+            s.maxRebuildsInOneTick = in.readInt();
+            s.duplicateFills = in.readLong();
+            s.duplicateOrders = in.readLong();
+            if (in.available() != 0) throw new SnapshotException(in.available() + " unexpected bytes at the end");
+            s.nextOffset = nextOffset;
+            s.lastTickSeq = lastTickSeq;
+            byte[] again = s.snapshotBody();
+            if (!java.util.Arrays.equals(again, 0, again.length, snapshot, 0, snapshot.length - CHECKSUM_BYTES)) {
+                throw new SnapshotException("the restored state does not snapshot back to the same bytes");
+            }
+            return s;
+        } catch (java.io.IOException | RuntimeException e) {
+            throw new SnapshotException("cannot restore snapshot: " + e.getMessage(), e);
+        }
+    }
+
+    private static String instrumentId(String[] ids, int index, TreeMap<String, Instrument> known) throws SnapshotException {
+        if (index < 0 || index >= ids.length) throw new SnapshotException("instrument number " + index + " out of range");
+        String id = ids[index];
+        if (!known.containsKey(id)) throw new SnapshotException("snapshot refers to instrument " + id + ", which is not in the instruments file");
+        return id;
     }
 
     // ---------------------------------------------------------------- state hash

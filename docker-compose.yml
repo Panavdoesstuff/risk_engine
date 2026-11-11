@@ -99,6 +99,8 @@ services:
     restart: "no"
 
   # One shard thread per engine-events partition. Lag metrics at :9100/metrics, health at :9100/healthz.
+  # Each shard snapshots every SNAPSHOT_EVERY_SECONDS of log time into the snapshots volume and, on start,
+  # carries on from its newest valid snapshot.
   shard-host:
     profiles: [app]
     image: risk-engine-app
@@ -114,7 +116,11 @@ services:
       - "${ENGINE_PARTITIONS:-4}"
       - --metrics-port
       - "9100"
-    volumes: ["${DATA_DIR:-./data}:/data:ro"]
+      - --snapshot-dir
+      - /snapshots
+      - --snapshot-every-seconds
+      - "${SNAPSHOT_EVERY_SECONDS:-60}"
+    volumes: ["${DATA_DIR:-./data}:/data:ro", "snapshots:/snapshots"]
     ports: ["${METRICS_PORT:-9100}:9100"]
     depends_on:
       book-loader: { condition: service_completed_successfully }
@@ -194,3 +200,4 @@ services:
 volumes:
   pgdata:
   redpanda:
+  snapshots:

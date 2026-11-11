@@ -26,15 +26,24 @@ public final class TickMetrics {
     /** Where a tick's latency is measured from. */
     @FunctionalInterface
     public interface Source {
-        /** Nanoseconds since the tick was sent, or a negative number if unknown. */
+        /** Returned when the send time is not known: the tick is not measured. */
+        long UNKNOWN = Long.MIN_VALUE;
+
+        /**
+         * Nanoseconds since the tick was sent, or {@link #UNKNOWN}. May be negative when the sender's clock
+         * is ahead of this process's (a tick written from another machine, or from the host into a VM).
+         */
         long sinceSentNanos(int shard, LoggedEvent tick);
     }
 
     private final int shards;
     private final LongAdder[][] buckets;
-    private final LongAdder[] latencyCount, latencySumNanos, ticks, events;
+    private final LongAdder[] latencyCount, latencySumNanos, ticks, events, clockSkew;
     private volatile Source source;
     private volatile LongConsumer[] listeners = new LongConsumer[0];
+    private final boolean[] active;
+    private final LongAdder[] snapshots, snapshotNanos;
+    private final java.util.concurrent.atomic.AtomicLongArray snapshotBytes;
 
     public TickMetrics(int shards, Source source) {
         this.shards = shards;
@@ -44,6 +53,11 @@ public final class TickMetrics {
         latencySumNanos = adders(shards);
         ticks = adders(shards);
         events = adders(shards);
+        clockSkew = adders(shards);
+        snapshots = adders(shards);
+        snapshotNanos = adders(shards);
+        snapshotBytes = new java.util.concurrent.atomic.AtomicLongArray(shards);
+        active = new boolean[shards];
         for (LongAdder[] b : buckets) for (int i = 0; i < b.length; i++) b[i] = new LongAdder();
     }
 
@@ -51,6 +65,35 @@ public final class TickMetrics {
         LongAdder[] a = new LongAdder[n];
         for (int i = 0; i < n; i++) a[i] = new LongAdder();
         return a;
+    }
+
+    /** Marks a shard as run by this process: only active shards are reported. */
+    void activate(int shard) {
+        active[shard] = true;
+    }
+
+    /** Called on the shard's thread after it captured its state for a snapshot. */
+    void snapshotTaken(int shard, long nanos) {
+        snapshots[shard].increment();
+        snapshotNanos[shard].add(nanos);
+    }
+
+    /** Called by the snapshot writer once a shard's snapshot is on disk. */
+    void snapshotWritten(int shard, long bytes) {
+        snapshotBytes.set(shard, bytes);
+    }
+
+    public long snapshotsTaken(int shard) {
+        return snapshots[shard].sum();
+    }
+
+    /** Total time shard {@code shard} spent capturing its state for snapshots, on its own thread. */
+    public long snapshotNanos(int shard) {
+        return snapshotNanos[shard].sum();
+    }
+
+    public long lastSnapshotBytes(int shard) {
+        return snapshotBytes.get(shard);
     }
 
     /** Replaces where latency is measured from (a load test that knows exactly when it sent each tick). */
@@ -71,7 +114,13 @@ public final class TickMetrics {
         if (!(e.event() instanceof Tick)) return;
         ticks[shard].increment();
         long nanos = source.sinceSentNanos(shard, e);
-        if (nanos < 0) return;
+        if (nanos == Source.UNKNOWN) return;
+        if (nanos < 0) {
+            // The sender's clock is ahead of ours by more than the latency. Count it as 0 rather than drop
+            // it (dropping silently left fast ticks out of the histogram and biased it upwards) and say so.
+            clockSkew[shard].increment();
+            nanos = 0;
+        }
         double seconds = nanos / 1e9;
         for (int i = 0; i < BUCKETS.length; i++) {
             if (seconds <= BUCKETS[i]) {
@@ -93,6 +142,7 @@ public final class TickMetrics {
         sb.append("# HELP risk_tick_to_margin_seconds From a tick being sent to the shard having recomputed every affected account.\n");
         sb.append("# TYPE risk_tick_to_margin_seconds histogram\n");
         for (int s = 0; s < shards; s++) {
+            if (!active[s]) continue;
             long cumulative = 0;
             for (int i = 0; i < BUCKETS.length; i++) {
                 cumulative += buckets[s][i].sum();
@@ -105,6 +155,10 @@ public final class TickMetrics {
         }
         counter(sb, "risk_ticks_applied_total", "Ticks the shard has applied.", ticks);
         counter(sb, "risk_events_applied_total", "Events of any kind the shard has applied.", events);
+        counter(sb, "risk_tick_clock_skew_total", "Ticks whose sender's clock was ahead of the shard host's: measured as 0 latency.", clockSkew);
+        counter(sb, "risk_snapshots_total", "Snapshots the shard has taken.", snapshots);
+        sb.append("# HELP risk_snapshot_bytes Size of the shard's last snapshot.\n# TYPE risk_snapshot_bytes gauge\n");
+        for (int s = 0; s < shards; s++) if (active[s]) sb.append("risk_snapshot_bytes{shard=\"").append(s).append("\"} ").append(snapshotBytes.get(s)).append('\n');
         // The JVM, for reading latency spikes against GC.
         long gcCount = 0, gcMillis = 0;
         List<GarbageCollectorMXBean> gcs = ManagementFactory.getGarbageCollectorMXBeans();
@@ -122,6 +176,6 @@ public final class TickMetrics {
 
     private void counter(StringBuilder sb, String name, String help, LongAdder[] values) {
         sb.append("# HELP ").append(name).append(' ').append(help).append('\n').append("# TYPE ").append(name).append(" counter\n");
-        for (int s = 0; s < shards; s++) sb.append(name).append("{shard=\"").append(s).append("\"} ").append(values[s].sum()).append('\n');
+        for (int s = 0; s < shards; s++) if (active[s]) sb.append(name).append("{shard=\"").append(s).append("\"} ").append(values[s].sum()).append('\n');
     }
 }

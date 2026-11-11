@@ -270,6 +270,36 @@ class PreTradeCheckTest {
     }
 
     @Test
+    void theWallClockReceiptTimeChangesNothing() {
+        // Two logs identical except for when the API says it received each order. The shard must produce
+        // the same outputs, byte for byte, and the same state hash: receivedAt is metadata, not input.
+        List<AccountBook> books = Fixtures.books(300, 61);
+        List<riskengine.events.Event> base = Fixtures.events(books, 60, 50, 62);
+        List<riskengine.events.Event> stamped = new ArrayList<>();
+        long wall = 1_799_000_000_000L;
+        int orders = 0;
+        for (riskengine.events.Event e : base) {
+            if (e instanceof OrderRequest o) {
+                orders++;
+                stamped.add(new OrderRequest(o.orderId(), o.accountId(), o.instrumentId(), o.side(), o.qty(), o.origin(), o.logTimeMillis(), wall += 7_919));
+            } else {
+                stamped.add(e);
+            }
+        }
+        assertTrue(orders > 20, "the stream has orders: " + orders);
+        ShardState a = new ShardState(0, Fixtures.CFG, ShardConfig.defaults(), INS, books), b = new ShardState(0, Fixtures.CFG, ShardConfig.defaults(), INS, books);
+        List<String> outA = new ArrayList<>(), outB = new ArrayList<>();
+        long offset = 0;
+        for (int i = 0; i < base.size(); i++, offset++) {
+            for (EngineOutput o : a.apply(new LoggedEvent(offset, base.get(i)))) outA.add(EngineOutputCodec.encode(o));
+            for (EngineOutput o : b.apply(new LoggedEvent(offset, stamped.get(i)))) outB.add(EngineOutputCodec.encode(o));
+        }
+        assertNotEquals(base, stamped, "the inputs really differ");
+        assertEquals(outA, outB);
+        assertEquals(a.stateHash(), b.stateHash());
+    }
+
+    @Test
     void theRuleItself() {
         assertEquals(new BigDecimal("123.46"), PreTradeCheck.mark(123.456));
         assertEquals(-50, PreTradeCheck.remainingAfterFill(-75, -25));

@@ -36,12 +36,16 @@ class StressRunTest {
         // Hide one fill from the reference (and nothing else). If the comparison is real, it must show up
         // both in the outputs and in that account's final state.
         StressReport r = StressRun.run(SMALL.withEvents(20_000, 150), recorded -> {
+            // The fill must be one the shard really applied: the race sometimes writes a fill twice (a
+            // duplicate callback), and hiding one copy of a duplicate changes nothing.
+            java.util.Map<String, Integer> copies = new java.util.HashMap<>();
+            for (List<Event> partition : recorded) for (Event e : partition) if (e instanceof Fill f) copies.merge(f.fillId(), 1, Integer::sum);
             List<List<Event>> copy = new ArrayList<>();
             boolean dropped = false;
             for (List<Event> partition : recorded) {
                 List<Event> events = new ArrayList<>(partition);
                 for (int i = events.size() / 2; i < events.size() && !dropped; i++) {
-                    if (events.get(i) instanceof Fill f && f.orderId().startsWith("X-")) {
+                    if (events.get(i) instanceof Fill f && f.orderId().startsWith("X-") && copies.get(f.fillId()) == 1) {
                         events.remove(i);
                         dropped = true;
                     }

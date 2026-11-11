@@ -36,6 +36,13 @@ public final class MarginStatusTracker {
         return squareOffStreak;
     }
 
+    /** Puts back a state saved in a snapshot. */
+    public void restore(MarginLevel level, int callStreak, int squareOffStreak) {
+        this.level = level;
+        this.callStreak = callStreak;
+        this.squareOffStreak = squareOffStreak;
+    }
+
     /**
      * A reading that may only lower the level (a fill, or the end of a square-off episode). Going down is
      * immediate, as on a tick; going up needs consecutive ticks, so this never raises anything and never

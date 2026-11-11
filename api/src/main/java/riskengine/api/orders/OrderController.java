@@ -53,8 +53,11 @@ class OrderController {
     private final OrderRepository orders;
     private final RedpandaLogs engineEvents;
     private final Clock clock;
+    private final riskengine.host.ReplayClock replayClock;
 
-    OrderController(ApiProperties props, ReplayGuard replayGuard, OrderRepository orders, RedpandaLogs engineEvents, Clock clock) {
+    OrderController(ApiProperties props, ReplayGuard replayGuard, OrderRepository orders, RedpandaLogs engineEvents, Clock clock,
+                    riskengine.host.ReplayClock replayClock) {
+        this.replayClock = replayClock;
         this.props = props;
         this.replayGuard = replayGuard;
         this.orders = orders;
@@ -86,7 +89,7 @@ class OrderController {
         }
 
         OrderRequest order = new OrderRequest(orderId, body.accountId(), body.instrumentId(), body.side(), body.qty(),
-                OrderRequest.Origin.USER, clock.millis());
+                OrderRequest.Origin.USER, replayClock.now(), clock.millis()); // log time = replay time; wall clock only as receivedAt
         try {
             if (!orders.insertPending(order, caller.userId(), caller.userId() + ":" + requestId)) {
                 // Not a replay and nothing was written, so the request id is free to use again.

@@ -41,6 +41,17 @@ tasks.register<JavaExec>("scale") {
     workingDir = rootDir
 }
 
+// M6 part 2: recovery time and snapshot size at 100k accounts:
+//   ./gradlew :loadtest:recovery --args="--bootstrap localhost:29092"
+tasks.register<JavaExec>("recovery") {
+    group = "verification"
+    description = "Snapshot under load, then time recovery from snapshots and from offset 0 at 100k accounts."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("riskengine.loadtest.RecoveryRun")
+    jvmArgs("-Xms6g", "-Xmx6g", "-XX:+AlwaysPreTouch")
+    workingDir = rootDir
+}
+
 tasks.named<JavaExec>("run") {
     workingDir = rootDir
 }

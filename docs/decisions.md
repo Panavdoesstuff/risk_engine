@@ -424,3 +424,86 @@ It reads the latest tick in `engine-events`, then continues: next `tick_seq`, th
 *Effect, same quiet machine, everything else equal* (the old engine with the new harness): shard CPU per tick went from 9.4 ms to 6.9 ms, about 25% less, and the flat-out rate from 100 to 119 ticks/s. With the old code the shards could not keep up at 100 ticks/s (p99 3.4 s, queue growing); with the new code p99 is 19.7 ms. On one thread with one shard there is no difference (4.2 ms either way for 25,000 accounts). The gain appears only when four shards compete for memory bandwidth, which is the situation that matters.
 
 *Headroom is thin.* The slowest shard sustains 119 ticks/s against a 100 ticks/s target, on four shards on a laptop with four fast cores. Two things not done yet: more shards (N is fixed for the life of a log, decision 10, so that is your call), and a leaner vector layout (all accounts' scenario losses in one flat array per shard). *See the report.*
+
+## M6 part 2: recovery, and follow-ups from part 1
+
+**95. Four shards, and changing the count needs a full replay.** *(Your call after M6 part 1.)*
+An account's shard is `murmur2(accountId) % N` (decision 36), so a different N moves most accounts to a different partition. Their history (fills, orders, closes) sits in the partition they used to live in, and snapshots are per shard. Changing N therefore means a new topic with N partitions, the whole history rewritten into it (ticks to every partition, each account's events to its new one), and every shard rebuilt by replaying from offset 0, with existing snapshots thrown away. A snapshot records nothing that would let it be split or merged, and a host refuses a topic whose partition count doesn't match its configuration (decision 46). Four shards give about 20% headroom at 100 ticks/s on the development laptop (decision 94).
+
+**96. Orders carry two times: log time for everything, wall-clock `receivedAt` as metadata only.** *(Your call after M6 part 1.)*
+The API now stamps an order's log time with the replay clock (the latest tick's log time, decision 87), like fills, and records the wall-clock moment it received the request as `receivedAtMillis`. The shard never reads `receivedAt`: it is in no decision, no output and not in the state hash. A test runs two logs that differ only in every order's `receivedAt` and requires identical outputs, byte for byte, and identical state hashes. Risk-ops `AccountControl` events also take replay time.
+- *Log format:* orders are now `ORDER|v2|…|logTime|receivedAt`. v1 lines (without it) still read, with `receivedAt = -1`.
+- `receivedAt` is for tracing a request through the API and the log. It is not a business timestamp.
+
+**97. Grafana in compose is for development only.** *(Your call after M6 part 1.)*
+Anonymous viewers are allowed and the admin password defaults to `admin` (`GRAFANA_ADMIN_PASSWORD` overrides it). Like the compose JWT secret (decision 69), that is fine on a laptop and wrong anywhere shared.
+
+**98. The flaky `m4-e2e`: Grafana not ready yet, and a script that could die without saying why.**
+*How it was found:* 10 runs in a row on a quiet machine passed 10/10, so the failure needed something else. Then 4 runs with every core kept busy: the 4th stopped in the monitoring step with curl's exit code 52 ("empty reply from server") and no FAIL line at all.
+*Two bugs:*
+1. The Grafana checks asked once. Grafana is the slowest service to start (it migrates its own database on first start), and on a loaded machine it wasn't serving yet. The run I saw fail earlier was the first after Grafana was added, which is that first start.
+2. A failing `curl` inside `$(…)` under `set -e` ended the script silently, before `fail` could print anything or dump diagnostics. That is why the earlier failure left almost nothing to go on.
+
+*The other single-shot checks, all made robust while at it:*
+- Prometheus' p99 now waits for a numeric answer, over a 2-minute window.
+- The rate-limit check sends 60 requests 30 at a time. One at a time, a slow machine can take long enough for the bucket to refill, and then nothing is refused.
+- "Square-off finished" must now hold three times in a row, 2 s apart, instead of true once and then failing if it flipped.
+
+*Fix:* every check waits; an ERR trap reports any unexpected failure with its line number and the full diagnostics.
+*Verified:* 4 of 4 under full CPU load with the fixed script. The 10 runs on the final code then found one more cause (decision 107), and 10 of 10 passed after that fix.
+
+**99. k6 load test for POST /orders, kept apart from the shard numbers.** *(Your call after M6 part 1.)*
+`scripts/k6-orders.sh` brings up its own compose stack with synthetic data and runs k6 (the `grafana/k6` image, on the compose network) against the API:
+- 100 traders, each with their own HS256 token, signed in the script exactly as the API expects
+- 1,000 orders/s in total for 60 s, a constant arrival rate: on average each user's 10/s limit, so the share of 429s shows how bursty arrivals meet the token bucket
+
+What it measures is the API path (JWT check, Redis rate limit and replay guard, the PENDING row in Postgres, the acknowledged write to Redpanda, 202), not the pre-trade check. It runs on the same laptop as everything else in compose, so it is a smoke-level number, not capacity planning.
+
+**100. Snapshots: a cheap capture on the shard's thread, everything else on a background writer.**
+- *When:* every M seconds of log time (configurable; `--snapshot-every-seconds`), checked after each tick, so between events.
+- *Capture, on the shard's thread:* a point-in-time copy. Positions, cash, reservations, margin results and markets are immutable, so only references are copied; vectors are copied as their 21 numbers; the risk state machine is copied field by field.
+- *Background writer, at low priority:* turns the capture into bytes in a fixed order (same state → same bytes), appends a SHA-256 checksum, writes a temporary file, fsyncs, renames it into place, and keeps the newest 3 per shard.
+- *Contents:* everything a shard knows (accounts, positions, vectors, reservations, the risk state, markets, seen fill and order ids, the next offset).
+- *Not stored:* risk arrays. They are recomputed from the markets on restore, and StrictMath gives the same bits.
+- *Encoding:* decimals as unscaled value plus scale, doubles by their exact bits, instruments as numbers into a table at the top.
+- *Where:* files in a directory (a compose volume), not the `engine_snapshots` table. That keeps the shard host free of Postgres, and a file write is easy to make atomic. *See the report.*
+
+**101. Recovery: the newest snapshot that passes every check, then replay from its offset.**
+A starting shard tries its snapshots newest first and takes the first that passes all of these:
+- the checksum matches (catches torn or damaged files)
+- it was written by this snapshot format version
+- it was taken with the same margin config fingerprint and drift-check settings
+- it holds exactly the accounts this shard owns (the book hasn't changed)
+- every instrument it mentions is in the instruments file
+- its offset isn't past the end of the partition (the topic hasn't been recreated)
+- the restored state, snapshotted again, gives exactly the same bytes, so every field came back as written
+
+Refused snapshots are listed with the reason. With none usable, the shard replays from offset 0, which reaches the same state, only slower. Shards restore in parallel. After the restore, events from the snapshot's offset are replayed and their outputs published again; consumers already dedupe on source offset and keys (decisions 64, 78).
+
+**102. The kill -9 test runs each shard as its own process and compares against an uninterrupted replay of the same log.**
+`ShardKillTest` runs the real `ShardHost` main once per shard (`--only p`), snapshotting every 5 minutes of log time, alongside the real writers, outbox relay, fill ingester and the chaos broker. While ticks, user orders and manual square-offs flow, a killer sends SIGKILL to a random shard at random moments, at least five times, and starts it again. Afterwards each shard is stopped cleanly and prints its offset and state hash.
+- *"A run with no kills":* a fresh, single-threaded replay of exactly what that partition holds. A second live run would see a different log (timing decides the order of events), so the same input replayed without interruption is the meaningful comparison.
+- *Also checked:* the broker executed every key once and no key was sent again after it arrived; no leg's fills exceed the leg; every ledger transaction sums to zero; no episode is left open.
+
+**103. Found by the kill test: the outbox relay could deadlock with the writers. My bug from M6 part 1.**
+When the relay got batch transactions for `SKIP LOCKED` (decision 88), it also moved each order to SENT inside that transaction, so it held order-row locks across slow HTTP calls. A writer batch updating the same orders to FILLED, in a different order, then waited on the relay while the relay waited on it. Postgres broke the deadlock by aborting the writer's batch, which retried and succeeded: nothing was lost, but the test treats any failed batch as a defect. Now the locked transaction touches only `outbox`, and the ACCEPTED→SENT updates run afterwards, one row per transaction, so the relay never holds two order rows at once. Clean in every run since.
+
+**104. Found by the e2e recovery step: one shard's snapshots could be crowded out by the others'.**
+The snapshot writer had one shared queue of 8 that dropped the oldest entry when full. In a minute-bar replay, log time moves 60 s per tick, so with M = 60 s every shard snapshots on every tick. The shard that finished first had all its snapshots pushed out before any was written, and after a kill it replayed from 0. Now each shard has one slot holding its newest unwritten snapshot (a newer one replaces it) and the writer serves the shards in turn. A test floods one shard and checks that another's single snapshot is still written.
+*Note:* in such a replay, every tick still pays the capture cost on the shard thread (about 20 ms at 25,000 accounts). For M7's crash-day replay at 100k accounts that is about 375 captures. A minimum wall-clock gap between snapshots would avoid it. *See the report.*
+
+**105. Correction to M6 part 1: 100 ticks/s is not sustained on this laptop.**
+Part 1 reported p99 19.7 ms at 100 ticks/s from 60-second windows. Two-minute runs at 100 ticks/s, after cooling the machine each time, gave p99 of 7.9 s and 495 ms with snapshots off, 31.7 ms and 690 ms with a snapshot every 60 s, and 84.8 ms every 30 s. Per-tick CPU varies 6.9–10 ms between runs of identical work on this fanless MacBook Air (thermals, efficiency-core scheduling). With only about 20% headroom at 100 ticks/s, a slow run falls behind for good. At 50 ticks/s, with a snapshot every minute, two-minute runs gave p99 of 35.8 ms and 15.7 ms. So the honest claim is: **p99 under 50 ms at 100k accounts is held at 50 ticks/s; at 100 ticks/s it is hit or miss on this machine.** The "119 ticks/s sustained" from part 1 is an 8-second flat-out burst, not a sustained rate. *See the report.*
+
+**106. Found while testing: Redpanda says "broker not available" when its disk is nearly full.**
+After hours of scale runs the Docker VM's disk was down to 21% free. Redpanda then refuses writes, and Kafka clients report that as `BrokerNotAvailableException`, which made every API test fail (on unchanged `main` too). The space was my own throwaway containers' anonymous volumes (`docker rm -f` without `-v` leaves them), a Docker-in-Docker volume and build cache. I removed only what was mine; your compose stack and its volumes were untouched. If the API answers 503 with "unavailable" on a laptop, check `docker system df` first.
+
+**107. The rest of the e2e flakiness: the latency metric silently dropped ticks when clocks disagreed.**
+After the Grafana fix, 10 runs still had 2 failures, both "Prometheus did not reach 2000 tick-latency samples". The diagnostics added to that step showed:
+- the shards had applied every tick (offsets about 880 per shard), but the histogram held only about 376 per shard: the replay's ticks, and almost none of the 500 synthetic ones;
+- the synthetic ticks are written from the Mac, so their record timestamp is the Mac's clock, while the shard host measures "now" inside Docker's Linux VM;
+- whenever the VM clock was a few milliseconds behind, a fast tick (3–5 ms) came out negative, and `TickMetrics` threw negative samples away. The VM clock drifts, so it happened in some runs and not others;
+- replay ticks wait in a queue, so their latencies were large enough to stay positive.
+
+*The bug was in the metric, not the script:* dropping fast samples hides exactly the ticks that are fastest, and biases the histogram upwards. Now a negative sample counts as 0 ms and increments `risk_tick_clock_skew_total`, so skew is visible; only a truly unknown send time is left out. The load-test numbers are not affected: `ScaleRun` and `RecoveryRun` time ticks with the same process's `System.nanoTime()`.
+*Cost:* in compose, tick-to-margin from the shard host's /metrics is only as good as the clocks of whoever writes ticks; for live data that is the market data feed's host. The load-test harness is the number to quote.

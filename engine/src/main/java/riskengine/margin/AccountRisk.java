@@ -235,6 +235,68 @@ public final class AccountRisk {
         return blocked;
     }
 
+    /** An independent copy with the same state (for a snapshot taken while the original carries on). */
+    public AccountRisk copy() {
+        AccountRisk c = new AccountRisk(accountId, thresholds);
+        c.tracker.restore(tracker.level(), tracker.callStreak(), tracker.squareOffStreak());
+        c.blocked = blocked;
+        c.exhausted = exhausted;
+        c.episodes = episodes;
+        c.episodeId = episodeId;
+        c.mode = mode;
+        c.episodeActor = episodeActor;
+        c.legSeq = legSeq;
+        c.inFlight = inFlight;
+        c.status = status;
+        return c;
+    }
+
+    /** Writes every field, for a snapshot. {@link #readFrom} reads them back in the same order. */
+    public void writeTo(java.io.DataOutputStream out) throws java.io.IOException {
+        out.writeByte(tracker.level().ordinal());
+        out.writeInt(tracker.callStreak());
+        out.writeInt(tracker.squareOffStreak());
+        out.writeBoolean(blocked);
+        out.writeBoolean(exhausted);
+        out.writeLong(episodes);
+        writeNullable(out, episodeId);
+        out.writeByte(mode == null ? -1 : mode.ordinal());
+        writeNullable(out, episodeActor);
+        out.writeInt(legSeq);
+        out.writeBoolean(inFlight != null);
+        if (inFlight != null) {
+            out.writeUTF(inFlight.legKey());
+            out.writeUTF(inFlight.instrumentId());
+            out.writeLong(inFlight.remaining());
+        }
+        out.writeByte(status.ordinal());
+    }
+
+    public void readFrom(java.io.DataInputStream in) throws java.io.IOException {
+        MarginLevel level = MarginLevel.values()[in.readByte()];
+        int call = in.readInt(), squareOff = in.readInt();
+        tracker.restore(level, call, squareOff);
+        blocked = in.readBoolean();
+        exhausted = in.readBoolean();
+        episodes = in.readLong();
+        episodeId = readNullable(in);
+        int m = in.readByte();
+        mode = m < 0 ? null : Mode.values()[m];
+        episodeActor = readNullable(in);
+        legSeq = in.readInt();
+        inFlight = in.readBoolean() ? new InFlight(in.readUTF(), in.readUTF(), in.readLong()) : null;
+        status = Status.values()[in.readByte()];
+    }
+
+    private static void writeNullable(java.io.DataOutputStream out, String s) throws java.io.IOException {
+        out.writeBoolean(s != null);
+        if (s != null) out.writeUTF(s);
+    }
+
+    private static String readNullable(java.io.DataInputStream in) throws java.io.IOException {
+        return in.readBoolean() ? in.readUTF() : null;
+    }
+
     /** Everything in this state machine as one line, for the shard's state hash and for comparing engines. */
     public String fingerprint() {
         return tracker.level() + "|" + tracker.callStreak() + "|" + tracker.squareOffStreak() + "|" + blocked + "|" + exhausted + "|"

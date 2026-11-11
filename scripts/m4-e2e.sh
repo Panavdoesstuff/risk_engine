@@ -5,13 +5,14 @@
 #   POST /orders   -> Redpanda -> shard's pre-trade check -> writers -> order ACCEPTED in Postgres and in GET /orders/{id}
 #   M5: accepted orders and square-off legs -> outbox -> relay -> mock broker (full chaos) -> fills -> ledger;
 #       the synthetic fall squares accounts off; risk-ops blocks and unblocks an account over HTTP
-#   M6: synthetic live ticks at 50/s -> tick-to-margin histogram scraped by Prometheus; Grafana serves the dashboard
+#   M6: synthetic live ticks at 50/s -> tick-to-margin histogram scraped by Prometheus; Grafana serves the dashboard;
+#       kill -9 the shard host, start it again: it restores from its snapshots and catches up
 #
 # It runs as its own compose project ("risk-e2e") on its own ports and volumes, so it never touches the
 # default stack or its data, and removes everything it created when it finishes.
 # The market data is SYNTHETIC (replayer demo): this checks the plumbing, not 4 June 2024.
 # Needs Docker with the compose plugin, a JDK 21+, curl.
-set -euo pipefail
+set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
 export COMPOSE_PROJECT_NAME=risk-e2e
@@ -37,6 +38,10 @@ fail() {
 }
 cleanup() { rm -f "$BODY" "$LOG"; docker compose --profile app down -v --remove-orphans >/dev/null 2>&1 || true; }
 trap cleanup EXIT
+# Any command that fails outside a check (set -e would otherwise end the script without a word, which is
+# how a Grafana that was not up yet once made a run stop silently) reports where it happened, with the
+# same diagnostics as a failed check.
+trap 'fail "unexpected failure (exit $?) at line $LINENO: $BASH_COMMAND"' ERR
 wait_for() { # wait_for "what" command...
   local what="$1"; shift
   for _ in $(seq 1 120); do if "$@" >/dev/null 2>&1; then return 0; fi; sleep 1; done
@@ -103,7 +108,7 @@ if [ "$final" = FILLED ]; then
   [ "$(psql -c "select count(*) from ledger_entries where ref_id in (select broker_fill_id from fills where order_id = '$order')")" -ge 2 ] || fail "no ledger entries for the premium paid"
 fi
 pass "orders row: $(psql -c "select id || ' ' || account_id || ' ' || instrument_id || ' ' || side || ' ' || qty || ' ' || status || ' required_after ' || required_after from orders where id = '$order'"); $(psql -c "select count(*) from fills where order_id = '$order'") fill(s)"
-view=$(curl -s "$API/orders/$order" -H "Authorization: Bearer $token")
+view=$(curl -s "$API/orders/$order" -H "Authorization: Bearer $token" || true)
 echo "$view" | grep -q "\"status\":\"$final\"" && echo "$view" | grep -q '"requiredAfter"' || fail "GET /orders/$order: $view"
 pass "GET /orders/$order: $view"
 
@@ -113,8 +118,10 @@ drained() {
   [ "$(psql -c "select count(*) from outbox where sent_at is null")" = 0 ] &&
   [ "$(psql -c "select count(*) from square_off_legs where status in ('PLANNED', 'SENT')")" = 0 ]
 }
-wait_for "every square-off episode to finish" drained
-sleep 3; drained || fail "square-off had not really finished"
+# "Finished" must hold for a while, not just at one instant: a leg rejected at the last moment is re-planned,
+# and Postgres sees the new leg a batch later.
+drained_steadily() { drained && sleep 2 && drained && sleep 2 && drained; }
+wait_for "every square-off episode to finish (and stay finished)" drained_steadily
 episodes=$(psql -c "select count(*) from square_off_episodes")
 [ "$episodes" -gt 0 ] || fail "the synthetic fall squared nobody off"
 pass "$episodes episodes: $(psql -c "select string_agg(status || ' ' || n, ', ') from (select status, count(*) n from square_off_episodes group by status) t"); $(psql -c "select string_agg(status || ' ' || n, ', ') from (select status, count(*) n from square_off_legs group by status) t") legs"
@@ -124,25 +131,46 @@ pass "every leg filled exactly once or rejected: 0 legs closed twice"
 unbalanced=$(psql -c "select count(*) from (select txn_id from ledger_entries group by txn_id having sum(amount) <> 0) t")
 [ "$unbalanced" = 0 ] || fail "$unbalanced unbalanced ledger transactions"
 pass "$(psql -c "select count(distinct txn_id) from ledger_entries") ledger transactions, all summing to zero; $(psql -c "select count(*) from fills") fills"
-pass "broker: $(curl -s "http://localhost:$BROKER_PORT/stats")"
+pass "broker: $(curl -s "http://localhost:$BROKER_PORT/stats" || echo unavailable)"
 
 echo "== monitoring: synthetic live ticks -> Prometheus -> Grafana"
 synth=$($R synth --redpanda "localhost:$REDPANDA_PORT" --rate 50 --seconds 10)
 pass "$synth"
-promq() { curl -s --get "http://localhost:$PROMETHEUS_PORT/api/v1/query" --data-urlencode "query=$1" | sed -E 's/.*"value":\[[^,]+,"([^"]+)".*/\1/'; }
+promq() { curl -s --get "http://localhost:$PROMETHEUS_PORT/api/v1/query" --data-urlencode "query=$1" | sed -E 's/.*"value":\[[^,]+,"([^"]+)".*/\1/' || true; }
 scraped() { promq 'sum(risk_tick_to_margin_seconds_count)' | awk '{exit !($1 >= 2000)}'; }
-wait_for "Prometheus to have scraped the tick latencies" scraped
-sleep 4
-p50=$(promq 'histogram_quantile(0.5, sum by (le) (rate(risk_tick_to_margin_seconds_bucket[1m])))')
-p99=$(promq 'histogram_quantile(0.99, sum by (le) (rate(risk_tick_to_margin_seconds_bucket[1m])))')
+scraped_or_explain() {
+  for _ in $(seq 1 120); do scraped && return 0; sleep 1; done
+  fail "Prometheus did not reach 2000 tick-latency samples: count=$(promq 'sum(risk_tick_to_margin_seconds_count)') per shard=$(promq 'risk_tick_to_margin_seconds_count' ) target=$(curl -s "http://localhost:$PROMETHEUS_PORT/api/v1/targets" | grep -oE '"(health|lastError)":"[^"]*"' | tr '\n' ' ') shard host says: $(curl -sf "http://localhost:$METRICS_PORT/metrics" | grep -E '^risk_(tick_to_margin_seconds_count|ticks_applied_total|shard_applied_offset)' | tr '\n' ' ')"
+}
+scraped_or_explain
+P99='histogram_quantile(0.99, sum by (le) (rate(risk_tick_to_margin_seconds_bucket[2m])))'
+has_p99() { promq "$P99" | grep -Eq '^[0-9.]+(e[+-]?[0-9]+)?$'; }
+wait_for "Prometheus to compute a p99" has_p99
+p50=$(promq 'histogram_quantile(0.5, sum by (le) (rate(risk_tick_to_margin_seconds_bucket[2m])))')
+p99=$(promq "$P99")
 tps=$(promq 'min(rate(risk_ticks_applied_total[30s]))')
-echo "$p99" | grep -Eq '^[0-9.e+-]+$' || fail "Prometheus has no p99: $p99"
-pass "Prometheus (the dashboard's own queries): p50 $p50 s, p99 $p99 s, slowest shard $tps ticks/s"
-dash=$(curl -s "http://localhost:$GRAFANA_PORT/api/dashboards/uid/risk-engine")
-echo "$dash" | grep -q '"title":"Risk engine"' || fail "Grafana has no Risk engine dashboard: $(echo "$dash" | head -c 300)"
-ds=$(curl -s "http://localhost:$GRAFANA_PORT/api/datasources/proxy/uid/prometheus/api/v1/query?query=risk_shard_up")
-echo "$ds" | grep -q '"status":"success"' || fail "Grafana cannot query Prometheus: $(echo "$ds" | head -c 300)"
-pass "Grafana serves the Risk engine dashboard ($(echo "$dash" | grep -o '"type":"timeseries"' | wc -l | tr -d ' ') charts) and queries Prometheus through its data source"
+skew=$(promq 'sum(risk_tick_clock_skew_total)')
+pass "Prometheus (the dashboard's own queries): p50 $p50 s, p99 $p99 s, slowest shard $tps ticks/s; $skew ticks measured as 0 because the host's clock was ahead of the VM's"
+# Grafana is the slowest service to start (it migrates its own database on first start, and on a busy
+# machine that takes a while): wait for it rather than ask once.
+dashboard() { curl -sf "http://localhost:$GRAFANA_PORT/api/dashboards/uid/risk-engine" | grep -q '"title":"Risk engine"'; }
+wait_for "Grafana to serve the Risk engine dashboard" dashboard
+datasource() { curl -sf "http://localhost:$GRAFANA_PORT/api/datasources/proxy/uid/prometheus/api/v1/query?query=risk_shard_up" | grep -q '"status":"success"'; }
+wait_for "Grafana to query Prometheus through its data source" datasource
+charts=$(curl -sf "http://localhost:$GRAFANA_PORT/api/dashboards/uid/risk-engine" | grep -o '"type":"timeseries"' | wc -l | tr -d ' ')
+pass "Grafana serves the Risk engine dashboard ($charts charts) and queries Prometheus through its data source"
+
+echo "== recovery: kill -9 the shard host and start it again"
+before=$(curl -sf "http://localhost:$METRICS_PORT/metrics" | awk '/^risk_shard_applied_offset/ {s+=$2} END {print s}')
+docker compose --profile app kill -s KILL shard-host >/dev/null 2>&1
+docker compose --profile app start shard-host >/dev/null 2>&1
+wait_for "the shard host to come back" curl -sf "http://localhost:$METRICS_PORT/healthz"
+restored() { [ "$(docker compose --profile app logs --no-color shard-host | grep -c 'restored from')" -ge 4 ]; }
+wait_for "all 4 shards to restore from a snapshot" restored
+caught_up_again() { curl -sf "http://localhost:$METRICS_PORT/metrics" | awk -v want="$before" '/^risk_shard_applied_offset/ {s+=$2} /^risk_shard_lag_events/ {l+=$2} END {exit !(s >= want && l == 0)}'; }
+wait_for "the restarted shards to catch up" caught_up_again
+pass "$(docker compose --profile app logs --no-color shard-host | grep 'restored from' | tail -4 | sed -E 's/.*\| //' | tr '\n' ';' | sed 's/;$//')"
+pass "caught up again: lag 0, applied offset >= $before"
 
 echo "== risk-ops over real HTTP"
 ops=$(./gradlew -q :api:devToken --args="risk-ops e2e-ops" | tail -1)
@@ -165,11 +193,11 @@ pass "no token -> 401"
 other='{"accountId":"A0000001x","instrumentId":"NIFTY-20240613-25000-CE","side":"BUY","qty":25}'
 [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/orders" -H "Authorization: Bearer $token" -H 'X-Request-Id: e2e-request-0002' -H 'Content-Type: application/json' -d "$other")" = 403 ] || fail "another account was not 403"
 pass "someone else's account -> 403"
-limited=0
-for i in $(seq 1 40); do
-  [ "$(curl -s -o /dev/null -w '%{http_code}' "$API/orders/$order" -H "Authorization: Bearer $token")" = 429 ] && limited=$((limited + 1))
-done
-[ "$limited" -gt 0 ] || fail "40 rapid requests were never rate limited"
-pass "40 rapid requests -> $limited answered 429"
+# 60 requests, 30 at a time: faster than the bucket can refill however slow the machine is. (One at a time,
+# on a busy machine, 40 requests can take long enough for the bucket to refill and nothing is refused.)
+codes=$(seq 1 60 | xargs -P 30 -I{} curl -s -o /dev/null -w '%{http_code}\n' "$API/orders/$order" -H "Authorization: Bearer $token" || true)
+limited=$(echo "$codes" | grep -c '^429$' || true)
+[ "$limited" -gt 0 ] || fail "60 requests at once were never rate limited: $(echo "$codes" | sort | uniq -c | tr '\n' ' ')"
+pass "60 requests at once -> $limited answered 429"
 
 echo "End-to-end passed."

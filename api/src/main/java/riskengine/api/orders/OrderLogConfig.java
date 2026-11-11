@@ -18,9 +18,15 @@ class OrderLogConfig {
         return new RedpandaLogs(props.kafkaBootstrap(), props.eventsTopic(), props.partitions(), Duration.ofMillis(100));
     }
 
-    /** The API is outside the engine, so it may read the wall clock: an order's log time is when it arrived. */
+    /** Wall clock: only for an order's receivedAt metadata. Never an event's log time. */
     @Bean
     Clock clock() {
         return Clock.systemUTC();
+    }
+
+    /** The replay's "now" (the latest tick's log time): the log time the API gives orders and risk-ops events. */
+    @Bean(destroyMethod = "close")
+    riskengine.host.ReplayClock replayClock(ApiProperties props) {
+        return new riskengine.host.ReplayClock(props.kafkaBootstrap(), props.eventsTopic());
     }
 }

@@ -8,7 +8,8 @@ import java.math.BigDecimal;
  *
  * <pre>
  *   TICK|v1|tickSeq|logTimeMillis|underlying|spot|vix
- *   ORDER|v1|orderId|accountId|instrumentId|side|qty|origin|logTimeMillis
+ *   ORDER|v2|orderId|accountId|instrumentId|side|qty|origin|logTimeMillis|receivedAtMillis
+ *   ORDER|v1|...  (as v2 without receivedAtMillis: still read, never written)
  *   FILL|v1|fillId|orderId|accountId|instrumentId|qty|price|logTimeMillis
  *   CLOSED|v1|orderId|accountId|reason|logTimeMillis
  *   CONTROL|v1|accountId|action|actor|requestId|logTimeMillis
@@ -22,8 +23,8 @@ public final class EventCodec {
         return switch (e) {
             case Tick t -> "TICK|v1|" + t.tickSeq() + "|" + t.logTimeMillis() + "|" + t.underlying() + "|"
                     + t.spot().toPlainString() + "|" + t.vix().toPlainString();
-            case OrderRequest o -> "ORDER|v1|" + o.orderId() + "|" + o.accountId() + "|" + o.instrumentId() + "|"
-                    + o.side() + "|" + o.qty() + "|" + o.origin() + "|" + o.logTimeMillis();
+            case OrderRequest o -> "ORDER|v2|" + o.orderId() + "|" + o.accountId() + "|" + o.instrumentId() + "|"
+                    + o.side() + "|" + o.qty() + "|" + o.origin() + "|" + o.logTimeMillis() + "|" + o.receivedAtMillis();
             case Fill f -> "FILL|v1|" + f.fillId() + "|" + f.orderId() + "|" + f.accountId() + "|" + f.instrumentId() + "|"
                     + f.qty() + "|" + f.price().toPlainString() + "|" + f.logTimeMillis();
             case OrderClosed c -> "CLOSED|v1|" + c.orderId() + "|" + c.accountId() + "|" + c.reason() + "|" + c.logTimeMillis();
@@ -36,6 +37,10 @@ public final class EventCodec {
     public static Event decode(String line) {
         String[] f = line.split("\\|", -1);
         try {
+            if (f.length == 10 && f[0].equals("ORDER") && f[1].equals("v2")) {
+                return new OrderRequest(f[2], f[3], f[4], OrderRequest.Side.valueOf(f[5]), Long.parseLong(f[6]),
+                        OrderRequest.Origin.valueOf(f[7]), Long.parseLong(f[8]), Long.parseLong(f[9]));
+            }
             if (f.length >= 2 && f[1].equals("v1")) {
                 switch (f[0]) {
                     case "TICK":

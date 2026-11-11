@@ -5,12 +5,12 @@ Fill in as you go. Every number names the commit and command that produced it.
 | Metric | Value | Where it comes from |
 | --- | --- | --- |
 | Accounts | **100,000** × 5 positions, 4 shards | M6 scale run |
-| p99 tick-to-margin | **28.8 / 14.2 / 19.7 ms** at 10 / 50 / 100 ticks/s (target 50 ms) | M6 scale run |
-| Sustained ticks/s | **119** (slowest shard, flat out, 1,000 orders/s alongside) | M6 scale run |
+| p99 tick-to-margin | **held at 50 ticks/s** (15.7 and 35.8 ms over 2-minute runs, snapshots on); hit or miss at 100 ticks/s on this laptop (see M6 part 2) | M6 scale runs |
+| Sustained ticks/s | **50** with p99 under 50 ms; flat-out bursts reach 105–127 for a few seconds | M6 scale runs |
 | Incremental speed-up | **27.4×** vs naive, **3.1×** vs full recompute (details below) | JMH / M3 |
 | Mismatches over 1M events | **0** (in-memory logs, and again through Redpanda; details below) | M4 harness |
 | Duplicate closes under chaos | **0** legs closed twice, 0 surplus legs, 0 unbalanced ledger transactions (details below) | M5 chaos gate |
-| Recovery hash match | | M6 |
+| Recovery hash match | **4 of 4 shards identical** after 6 kills -9 under chaos; 0 duplicate broker orders | M6 kill test |
 | Crash day: warned / called / squared off | | M7 report |
 
 ## M3: incremental vs full, per tick
@@ -28,6 +28,59 @@ The average is the same as before the rolling rebuild (1,402 ± 12 µs), as expe
 Read this honestly: most of the 27× is "price each instrument once", which the full recompute also does. The delta update itself is the 3.1×. See decisions.md #44.
 
 At this rate one shard handles roughly 700 ticks per second for 10,000 accounts. M6 measures the real target (100k accounts, p99).
+
+## M6 part 2: recovery
+
+### Kill -9 under a chaos square-off (`ShardKillTest`, runs on every build)
+
+400 accounts, 80 ticks, each shard its own process, a snapshot every 5 minutes of log time; the real writers, relay and fill ingester, and the mock broker at full chaos. Six SIGKILLs at random moments to random shards, each followed by a restart.
+
+| | Result |
+| --- | --- |
+| Kills -9 / restarts from a snapshot / from offset 0 | 6 / 6 / 0 (each snapshot loaded in 17–19 ms) |
+| **State hash after recovery vs an uninterrupted replay of the same log** | **4 of 4 shards identical** |
+| Broker: distinct keys / executed / sent again after it had them | 890 / 890 / 0: **0 duplicate broker orders** |
+| Legs closed twice / ledger transactions not summing to zero / episodes left open | 0 / 0 / 0 |
+| Outputs published again after restarts | 125 of 3,953, all absorbed by the writers |
+
+### Recovery time and snapshot size at 100k accounts (`./gradlew :loadtest:recovery`)
+
+100,000 accounts × 5 positions, 4 shards, 2,500 ticks at 100/s with 1,000 orders/s, a snapshot every 10 s of log time (every 1,000 ticks). The host is stopped, then started again: once with its snapshots, once without. Three runs; median shown, range in brackets. Every run reached exactly the state hashes of the run that wrote the snapshots.
+
+| | Load (read, checksum, restore, verify) | Replay to the end | Events replayed | **Total** |
+| --- | ---: | ---: | ---: | ---: |
+| From snapshots | 0.74 s [0.70–0.75] | 5.3 s [4.9–9.9] | about 8,000 (≈2,000 per shard) | **6.0 s** [5.7–10.6] |
+| From offset 0 | 0.14 s | 19.5 s [16.9–19.7] | 36,000 | 19.7 s [17.0–19.9] |
+
+- **Snapshot size:** 11.7–11.9 MB per shard, **47 MB for 100k accounts (about 470 bytes per account)**. It grows with the seen-order and seen-fill sets, which are never pruned: 12.3–13.2 MB per shard after 2-minute runs with 1,000 orders/s.
+- **Replay dominates,** and it is bound by ticks (about 7 ms each per shard at 25,000 accounts). The worst case is replaying M seconds of log: about 0.7 × M seconds at 100 ticks/s, plus about 0.7 s to load. With M = 60 s, up to about 40 s.
+- **Cost on the shard thread:** a capture takes 18–37 ms at 25,000 accounts; serialising, checksumming and writing happen on a background thread. At 100 ticks/s that pause still costs p99 when snapshots are frequent (30 s: 84.8 ms; 10 s: 111 ms). At 50 ticks/s with one a minute, p99 stays under the target (below).
+
+### Correction: sustained p99 at 100k accounts
+
+Part 1's 100 ticks/s figure (p99 19.7 ms) came from 60-second windows. In two-minute runs on this fanless laptop, cooled before each run, it is not reliable (decision 105):
+
+| 2 minutes at 100k accounts | p99 by run | Shard CPU per tick |
+| --- | --- | --- |
+| 100 ticks/s, snapshots off | 7,949 ms; 495 ms | 8.7; 7.3 ms |
+| 100 ticks/s, a snapshot every 60 s | 31.7 ms; 690 ms | 7.2; 8.2 ms |
+| 100 ticks/s, a snapshot every 30 s | 84.8 ms | 7.6 ms |
+| **50 ticks/s, a snapshot every 60 s** | **35.8 ms; 15.7 ms** | 8.2; 7.6 ms |
+
+### k6: POST /orders (the API only)
+
+`scripts/k6-orders.sh`: k6 0.54 against the compose stack on the same laptop, 60 s, constant arrival rate of 1,000 requests/s, each user with their own HS256 token. These are API numbers (JWT check, Redis rate limit and replay guard, PENDING row in Postgres, acknowledged write to Redpanda); they say nothing about the shards.
+
+| | Requests/s | p50 | p90 | p99 | 429s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 100 users, about 10/s each (at the limit) | 968 | 3.6 ms | 131 ms | 893 ms | 0% |
+| 20 users, 50/s each (5× the limit) | 994 | 0.32 ms (all) / 2.6 ms (202s) | 2.7 ms / 4.8 ms | 18 ms / 723 ms | 79.4% |
+
+With users at the limit, k6 dropped 1,935 requests because all 600 of its virtual users were waiting on slow responses. Accepted orders have a heavy tail (p99 0.7–0.9 s). The likely cause is the synchronous `acks=all` write per request to a single-core Redpanda on the same laptop, but I haven't profiled it.
+
+### Tests
+
+`./gradlew build`: 147 tests, 0 failures. `scripts/m4-e2e.sh`: 10 of 10 on the final code, now including kill -9 of the shard host and recovery from snapshots in compose.
 
 ## M6 part 1: tick-to-margin at 100k accounts
 

@@ -130,6 +130,19 @@ public final class AccountVector {
         return c;
     }
 
+    /** A vector with exactly these values, in {@link #components()} order (from a snapshot). */
+    public static AccountVector of(String underlying, double[] components) {
+        if (components.length != COMPONENTS) throw new IllegalArgumentException("expected " + COMPONENTS + " components, got " + components.length);
+        AccountVector v = new AccountVector(underlying);
+        System.arraycopy(components, 0, v.scenarioLoss, 0, ScenarioGrid.SIZE);
+        v.netOptionValue = components[ScenarioGrid.SIZE];
+        v.shortOptionNotional = components[ScenarioGrid.SIZE + 1];
+        v.exposureNotional = components[ScenarioGrid.SIZE + 2];
+        v.futuresValue = components[ScenarioGrid.SIZE + 3];
+        v.futuresCost = components[ScenarioGrid.SIZE + 4];
+        return v;
+    }
+
     /** Overwrites this vector with {@code other}'s values (same underlying). */
     public void copyFrom(AccountVector other) {
         if (!other.underlying.equals(underlying)) throw new IllegalArgumentException("different underlying");

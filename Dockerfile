@@ -19,7 +19,7 @@ COPY broker-mock broker-mock
 RUN ./gradlew --no-daemon :host:installDist :writers:installDist :replayer:installDist :broker-mock:installDist :api:bootJar -x test
 
 FROM eclipse-temurin:21-jre
-RUN useradd --system --uid 10001 risk
+RUN useradd --system --uid 10001 risk && mkdir -p /snapshots && chown risk /snapshots
 COPY --from=build /src/host/build/install/host /opt/host
 COPY --from=build /src/writers/build/install/writers /opt/writers
 COPY --from=build /src/replayer/build/install/replayer /opt/replayer

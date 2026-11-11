@@ -1,7 +1,6 @@
 package riskengine.api.accounts;
 
 import java.math.BigDecimal;
-import java.time.Clock;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -46,13 +45,13 @@ class AccountController {
     private final JdbcTemplate jdbc;
     private final ReplayGuard replayGuard;
     private final RedpandaLogs engineEvents;
-    private final Clock clock;
+    private final riskengine.host.ReplayClock replayClock;
 
-    AccountController(JdbcTemplate jdbc, ReplayGuard replayGuard, RedpandaLogs engineEvents, Clock clock) {
+    AccountController(JdbcTemplate jdbc, ReplayGuard replayGuard, RedpandaLogs engineEvents, riskengine.host.ReplayClock replayClock) {
         this.jdbc = jdbc;
         this.replayGuard = replayGuard;
         this.engineEvents = engineEvents;
-        this.clock = clock;
+        this.replayClock = replayClock;
     }
 
     /** @param status ACTIVE, MARGIN_CALL, SQUARING_OFF or BLOCKED, as last written by the engine */
@@ -102,7 +101,7 @@ class AccountController {
             throw new ApiException(HttpStatus.CONFLICT, new ApiError("replayed_request", "this X-Request-Id was already used (" + firstUse + ")", null, null));
         }
         try {
-            engineEvents.append(new AccountControl(accountId, action, "risk-ops:" + caller.userId(), requestId, clock.millis()));
+            engineEvents.append(new AccountControl(accountId, action, "risk-ops:" + caller.userId(), requestId, replayClock.now()));
         } catch (RuntimeException e) {
             replayGuard.release(caller.userId(), requestId); // nothing was written: the same request may be sent again
             throw e;

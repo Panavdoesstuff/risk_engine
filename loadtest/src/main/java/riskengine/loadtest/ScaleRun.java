@@ -61,6 +61,11 @@ public final class ScaleRun {
         int ordersPerSecond = Integer.parseInt(f.getOrDefault("orders", "1000"));
         int flatOut = Integer.parseInt(f.getOrDefault("flat-out-ticks", "3000"));
         int[] rates = Arrays.stream(f.getOrDefault("rates", "10,50,100").split(",")).mapToInt(Integer::parseInt).toArray();
+        // Optional: snapshots every N seconds of log time while measuring (BenchBook ticks are 10 ms apart
+        // in log time, so at 100 ticks/s log time runs at wall-clock speed).
+        double snapshotEvery = Double.parseDouble(f.getOrDefault("snapshot-every-seconds", "0"));
+        ShardHost.Options options = snapshotEvery <= 0 ? ShardHost.Options.defaults()
+                : new ShardHost.Options(null, new riskengine.host.SnapshotStore(java.nio.file.Files.createTempDirectory("scale-snapshots"), 2), (long) (snapshotEvery * 1000));
 
         List<Instrument> instruments = BenchBook.instruments();
         long buildStart = System.nanoTime();
@@ -82,11 +87,12 @@ public final class ScaleRun {
         Arrays.fill(lastCpu, -1);
         AtomicLong cpuSum = new AtomicLong(), cpuCount = new AtomicLong();
 
-        try (ShardHost host = new ShardHost(bootstrap, events, out, n, MarginConfig.defaults(), ShardConfig.defaults(), instruments, books);
+        try (ShardHost host = new ShardHost(bootstrap, events, out, n, MarginConfig.defaults(), ShardConfig.defaults(), instruments, books, options);
              RedpandaLogs log = new RedpandaLogs(bootstrap, events, n, Duration.ofMillis(100))) {
-            System.out.printf(Locale.ROOT, "scale: %,d accounts x %d positions over %d instruments, %d shards; book and shards built in %.1f s; JVM max heap %,d MB, %d cores; system load %.1f%n",
+            System.out.printf(Locale.ROOT, "scale: %,d accounts x %d positions over %d instruments, %d shards; book and shards built in %.1f s; JVM max heap %,d MB, %d cores; system load %.1f; snapshots %s%n",
                     accounts, positions, instruments.size(), n, (System.nanoTime() - buildStart) / 1e9,
-                    Runtime.getRuntime().maxMemory() >> 20, Runtime.getRuntime().availableProcessors(), ManagementFactory.getOperatingSystemMXBean().getSystemLoadAverage());
+                    Runtime.getRuntime().maxMemory() >> 20, Runtime.getRuntime().availableProcessors(), ManagementFactory.getOperatingSystemMXBean().getSystemLoadAverage(),
+                    snapshotEvery <= 0 ? "off" : "every " + snapshotEvery + " s of log time");
             host.tickMetrics().measureFrom((shard, e) -> {
                 long seq = ((Tick) e.event()).tickSeq();
                 long nanos = System.nanoTime() - sentAt[(int) seq];
@@ -183,6 +189,12 @@ public final class ScaleRun {
             orderThread.interrupt();
             orderThread.join();
             long[] gcAfter = gc();
+            if (snapshotEvery > 0) {
+                for (int p = 0; p < n; p++) {
+                    System.out.printf(Locale.ROOT, "snapshots: shard %d took %d, %.1f ms each on its thread (capture), last written %,d bytes%n", p, host.tickMetrics().snapshotsTaken(p),
+                            host.tickMetrics().snapshotNanos(p) / 1e6 / Math.max(1, host.tickMetrics().snapshotsTaken(p)), host.tickMetrics().lastSnapshotBytes(p));
+                }
+            }
             System.out.printf(Locale.ROOT, "flat out: %,d ticks, the slowest shard sustained %,.0f ticks/s (with %,d orders/s in parallel); %d GCs, %d ms%n",
                     flatOut, slowest, ordersPerSecond, gcAfter[0] - gcBefore[0], gcAfter[1] - gcBefore[1]);
             host.stop();

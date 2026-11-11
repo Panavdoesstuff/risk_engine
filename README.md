@@ -2,7 +2,7 @@
 
 A deterministic, sharded margin engine for Indian index derivatives (Nifty, Bank Nifty), replayed against the 4 June 2024 election-result crash.
 
-**Status:** M6 part 1 done: at 100,000 accounts (5 positions each, 4 shards), p99 tick-to-margin is **28.8 / 14.2 / 19.7 ms at 10 / 50 / 100 ticks/s** (target 50 ms), with the slowest shard sustaining 119 ticks/s, on a laptop. Before that, M5 (the MVP line): an idempotent square-off pipeline under a chaos broker (0 legs closed twice, 0 surplus legs, every ledger transaction sums to zero) on top of M4's sharded engine, order API and Postgres projection. Next: M6 part 2 (snapshots, recovery, `kill -9`). M1 is waiting only on real market data.
+**Status:** M6 done. Recovery: shards snapshot every M seconds of log time and restart from their newest valid snapshot. After 6 `kill -9`s in the middle of a chaos square-off, every shard's state hash equals an uninterrupted replay, with 0 duplicate broker orders. At 100,000 accounts recovery takes about 6 s and snapshots are 47 MB. Scale: p99 tick-to-margin stays under 50 ms at 100,000 accounts at 50 ticks/s; at 100 ticks/s it is hit or miss on the development laptop (docs/results.md). Before that, M5 (the MVP line): an idempotent square-off pipeline under a chaos broker (0 legs closed twice, 0 surplus legs, every ledger transaction sums to zero) on top of M4's sharded engine, order API and Postgres projection. Next: M7, the crash-day replay. M1 is waiting only on real market data.
 
 ## Quick start
 
