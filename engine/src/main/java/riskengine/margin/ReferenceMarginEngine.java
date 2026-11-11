@@ -13,6 +13,7 @@ import riskengine.events.Event;
 import riskengine.events.EventLog;
 import riskengine.events.Fill;
 import riskengine.events.LoggedEvent;
+import riskengine.events.OrderClosed;
 import riskengine.events.OrderRequest;
 import riskengine.events.SquareOffResult;
 import riskengine.events.Tick;
@@ -32,6 +33,7 @@ import riskengine.ref.Instrument;
  *   <li>An account is only evaluated once every underlying it holds has had a tick.</li>
  *   <li>A USER OrderRequest gets the pre-trade margin check ({@link PreTradeCheck}); an accepted order
  *       reserves margin until it fills. Repeats of an order id are ignored.</li>
+ *   <li>OrderClosed releases what is left of that order's reservation.</li>
  *   <li>SquareOffResult, and orders the engine itself would originate (SQUARE_OFF), do nothing until M5.</li>
  * </ul>
  */
@@ -63,6 +65,8 @@ public final class ReferenceMarginEngine {
     private final SortedSet<String> seenFillIds = new TreeSet<>();
     private final SortedSet<String> seenOrderIds = new TreeSet<>();
     private long lastTickSeq = Long.MIN_VALUE;
+    /** Risk arrays at the current market, filled in as they are needed and thrown away on every tick. */
+    private SortedMap<String, RiskArray> arrays = new TreeMap<>();
 
     public ReferenceMarginEngine(MarginConfig cfg, Collection<Instrument> instruments, Collection<AccountBook> books) {
         this.cfg = cfg;
@@ -87,11 +91,9 @@ public final class ReferenceMarginEngine {
     public List<EngineOutput> apply(Event e) {
         return switch (e) {
             case Tick t -> List.copyOf(onTick(t));
-            case Fill f -> {
-                onFill(f);
-                yield List.of();
-            }
+            case Fill f -> onFill(f);
             case OrderRequest o -> onOrder(o);
+            case OrderClosed c -> onClosed(c);
             case SquareOffResult s -> List.of();
         };
     }
@@ -105,7 +107,6 @@ public final class ReferenceMarginEngine {
         OrderDecision.Reason bad = PreTradeCheck.structuralReject(i, cfg, o);
         if (bad != null) return List.of(OrderDecision.rejected(o, bad, lastTickSeq));
         long qty = PreTradeCheck.signedQty(o);
-        SortedMap<String, RiskArray> arrays = new TreeMap<>();
         MarginResult before = whatIf(a, null, 0, arrays);
         MarginResult after = markets.containsKey(i.underlying()) ? whatIf(a, i.id(), qty, arrays) : null;
         if (before == null || after == null) return List.of(OrderDecision.rejected(o, OrderDecision.Reason.NO_MARKET, lastTickSeq));
@@ -141,7 +142,7 @@ public final class ReferenceMarginEngine {
         UnderlyingParams p = cfg.params(t.underlying());
         markets.put(t.underlying(), new MarketState(t.underlying(), t.spot().doubleValue(), t.vix().doubleValue() * p.volScale(), t.logTimeMillis()));
 
-        SortedMap<String, RiskArray> arrays = new TreeMap<>(); // priced once per instrument per tick
+        arrays = new TreeMap<>(); // priced once per instrument per tick
         List<MarginEvent> events = new ArrayList<>();
         for (Account a : accounts.values()) {
             if (!holds(a, t.underlying())) continue;
@@ -154,8 +155,15 @@ public final class ReferenceMarginEngine {
         return events;
     }
 
-    public void onFill(Fill f) {
-        if (!seenFillIds.add(f.fillId())) return;
+    /** Releases whatever the order still had reserved. */
+    public List<EngineOutput> onClosed(OrderClosed c) {
+        Account a = accounts.get(c.accountId());
+        PendingOrder p = a == null ? null : a.pending.remove(c.orderId());
+        return List.of(new OrderClosure(c.orderId(), c.accountId(), c.reason(), p == null ? 0 : p.remaining(), c.logTimeMillis()));
+    }
+
+    public List<EngineOutput> onFill(Fill f) {
+        if (!seenFillIds.add(f.fillId())) return List.of();
         Account a = accounts.get(f.accountId());
         if (a == null) throw new IllegalStateException("fill " + f.fillId() + " for unknown account " + f.accountId());
         Instrument i = instrument(f.instrumentId(), f.accountId());
@@ -169,8 +177,9 @@ public final class ReferenceMarginEngine {
             if (left == 0) a.pending.remove(f.orderId());
             else a.pending.put(f.orderId(), new PendingOrder(p.instrumentId(), left));
         }
-        MarginResult r = margin(a.positions, a.cash, a.collateral, new TreeMap<>());
+        MarginResult r = margin(a.positions, a.cash, a.collateral, arrays);
         if (r != null) a.latest = r;
+        return List.of(new PositionChange(a.id, i.id(), o.position().qty(), o.position().avgPrice(), a.cash, f.fillId(), f.logTimeMillis()));
     }
 
     private boolean holds(Account a, String underlying) {

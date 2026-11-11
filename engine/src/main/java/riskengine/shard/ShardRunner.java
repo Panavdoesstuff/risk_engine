@@ -18,14 +18,33 @@ public final class ShardRunner implements Runnable {
 
     private final ShardState state;
     private final EventLog log;
-    private final Consumer<EngineOutput> sink;
+    private final OutputSink sink;
     // The only two things other threads may read while the shard runs.
     private volatile long appliedOffset;
     private volatile boolean stopRequested;
     private volatile Throwable failure;
 
-    /** @param sink receives level changes and order decisions on the shard's thread, in log order */
+    /** Receives everything the shard says, on the shard's thread, in log order. */
+    @FunctionalInterface
+    public interface OutputSink {
+        /**
+         * @param sourceOffset offset, in this shard's partition, of the event that caused the output. It
+         *                     is the same on every replay of the log, so consumers can use it to tell an
+         *                     old output from a new one.
+         */
+        void accept(long sourceOffset, EngineOutput out);
+    }
+
     public ShardRunner(ShardState state, EventLog log, Consumer<EngineOutput> sink) {
+        this(state, log, (OutputSink) (offset, out) -> sink.accept(out), true);
+    }
+
+    /** Like the constructor, for a sink that also wants each output's source offset. */
+    public static ShardRunner withOffsets(ShardState state, EventLog log, OutputSink sink) {
+        return new ShardRunner(state, log, sink, true);
+    }
+
+    private ShardRunner(ShardState state, EventLog log, OutputSink sink, boolean unused) {
         this.state = state;
         this.log = log;
         this.sink = sink;
@@ -59,7 +78,7 @@ public final class ShardRunner implements Runnable {
 
     private void applyAll(List<LoggedEvent> batch) {
         for (LoggedEvent e : batch) {
-            state.apply(e).forEach(sink);
+            for (EngineOutput out : state.apply(e)) sink.accept(e.offset(), out);
             appliedOffset = state.nextOffset();
         }
     }

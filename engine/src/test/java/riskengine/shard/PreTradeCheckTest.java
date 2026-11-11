@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import riskengine.events.Event;
 import riskengine.events.Fill;
 import riskengine.events.LoggedEvent;
+import riskengine.events.OrderClosed;
 import riskengine.events.OrderRequest;
 import riskengine.events.OrderRequest.Side;
 import riskengine.events.Tick;
@@ -18,6 +19,7 @@ import riskengine.margin.AccountBook;
 import riskengine.margin.EngineOutput;
 import riskengine.margin.EngineOutputCodec;
 import riskengine.margin.MarginEvent;
+import riskengine.margin.OrderClosure;
 import riskengine.margin.OrderDecision;
 import riskengine.margin.OrderDecision.Reason;
 import riskengine.margin.Position;
@@ -147,6 +149,45 @@ class PreTradeCheckTest {
     }
 
     @Test
+    void closingAnOrderReleasesWhatItStillHadReserved() {
+        Both b = new Both(account("A", "110000"));
+        b.tick(1, "23300");
+        assertTrue(b.order("O-1", "A", CALL, Side.SELL, 25).accepted());
+        assertFalse(b.order("O-2", "A", CALL, Side.SELL, 25).accepted(), "O-1 holds the margin");
+
+        // The broker rejects O-1. Its reservation goes, and the same order now fits again.
+        OrderClosure closed = (OrderClosure) b.apply(new OrderClosed("O-1", "A", OrderClosed.Reason.REJECTED, Fixtures.T0)).get(0);
+        assertEquals(-25, closed.released());
+        assertTrue(b.shard.pendingOrders("A").isEmpty());
+        assertTrue(b.order("O-3", "A", CALL, Side.SELL, 25).accepted(), "the margin is free again");
+
+        // Closing again, closing a rejected order, an unknown order or an unknown account: nothing to release.
+        for (OrderClosed again : List.of(
+                new OrderClosed("O-1", "A", OrderClosed.Reason.REJECTED, Fixtures.T0),
+                new OrderClosed("O-2", "A", OrderClosed.Reason.CANCELLED, Fixtures.T0),
+                new OrderClosed("O-never", "A", OrderClosed.Reason.UNFILLED, Fixtures.T0),
+                new OrderClosed("O-3", "NOBODY", OrderClosed.Reason.CANCELLED, Fixtures.T0))) {
+            assertEquals(0, ((OrderClosure) b.apply(again).get(0)).released(), again.toString());
+        }
+        assertEquals(1, b.shard.pendingOrders("A").size(), "O-3 is untouched");
+    }
+
+    @Test
+    void closingAPartlyFilledOrderReleasesOnlyTheUnfilledPart() {
+        Both b = new Both(account("A", "5000000"));
+        b.tick(1, "23300");
+        assertTrue(b.order("O-1", "A", CALL, Side.SELL, 75).accepted());
+        b.fill("F1", "O-1", "A", CALL, -25, "250");
+        OrderClosure closed = (OrderClosure) b.apply(new OrderClosed("O-1", "A", OrderClosed.Reason.UNFILLED, Fixtures.T0)).get(0);
+        assertEquals(-50, closed.released());
+        assertEquals(-25, b.shard.positions("A").get(CALL.id()).qty(), "what filled stays filled");
+        // A late fill for the closed order still changes the position (the trade happened) and releases nothing.
+        b.fill("F2", "O-1", "A", CALL, -25, "250");
+        assertEquals(-50, b.shard.positions("A").get(CALL.id()).qty());
+        assertTrue(b.shard.pendingOrders("A").isEmpty());
+    }
+
+    @Test
     void anAccountOverItsLimitMayStillReduceRiskButNotAddToIt() {
         // Short 10 lots of futures with far too little cash: utilisation is well over 100%.
         Both b = new Both(account("A", "100000", FUT, -250, "23300"));
@@ -247,15 +288,19 @@ class PreTradeCheckTest {
             }
         }
         lines.add(EngineOutputCodec.encode(b.order("O-1", "RICH", CALL, Side.SELL, 25)));
+        lines.add(EngineOutputCodec.encode(b.apply(new Fill("F1", "O-1", "RICH", CALL.id(), -25, new BigDecimal("250.50"), 9)).get(0)));
+        assertEquals("POSITION|v1|RICH|NIFTY-20240613-23300-CE|-25|250.500000|5006262.50|F1|9", lines.get(lines.size() - 1));
+        lines.add(EngineOutputCodec.encode(b.apply(new OrderClosed("O-1", "RICH", OrderClosed.Reason.UNFILLED, 10)).get(0)));
+        assertEquals("RELEASED|v1|O-1|RICH|UNFILLED|0|10", lines.get(lines.size() - 1), "fully filled, so nothing was left to release");
+        lines.add(EngineOutputCodec.encode(b.order("O-0", "RICH", CALL, Side.SELL, 25)));
         lines.add(EngineOutputCodec.encode(b.order("O-2", "NOBODY", CALL, Side.SELL, 25)));
         assertTrue(lines.stream().anyMatch(l -> l.startsWith("MARGIN|v1|THIN|")), lines.toString());
-        assertTrue(lines.get(lines.size() - 2).startsWith("DECISION|v1|O-1|RICH|NIFTY-20240613-23300-CE|SELL|25|ACCEPTED|OK|4|"), lines.toString());
+        assertTrue(lines.get(lines.size() - 5).startsWith("DECISION|v1|O-1|RICH|NIFTY-20240613-23300-CE|SELL|25|ACCEPTED|OK|4|"), lines.toString());
         assertEquals("DECISION|v1|O-2|NOBODY|NIFTY-20240613-23300-CE|SELL|25|REJECTED|UNKNOWN_ACCOUNT|4|" + Fixtures.T0 + "|0.0000|0.0000|0.000000",
                 lines.get(lines.size() - 1));
         for (String line : lines) {
             EngineOutput decoded = EngineOutputCodec.decode(line);
             assertEquals(line, EngineOutputCodec.encode(decoded), "decode then encode gives the same line");
-            assertTrue(decoded instanceof MarginEvent || decoded instanceof OrderDecision);
         }
         assertThrows(IllegalArgumentException.class, () -> EngineOutputCodec.decode("DECISION|v1|O|A|I|BUY|25|MAYBE|OK|1|1|0|0|0"));
         assertThrows(IllegalArgumentException.class, () -> EngineOutputCodec.decode("MARGIN|v2|x"));

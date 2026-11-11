@@ -4,6 +4,8 @@ plugins {
 
 dependencies {
     implementation(project(":engine"))
+    // For `ticks --redpanda`: the replayer is the only tick writer, on files or on the broker.
+    implementation(project(":host"))
 }
 
 application {

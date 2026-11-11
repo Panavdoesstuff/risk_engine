@@ -4,4 +4,5 @@ rootProject.name = "risk-engine"
 // M1: engine (reference data), replayer (loaders + seeded book generator).
 // M3: loadtest (JMH benchmarks; load scripts arrive in M6).
 // M4: host (Redpanda event log + the process that runs one shard per partition), api (Spring Boot order API).
-include("engine", "replayer", "loadtest", "host", "api")
+// M4 part 2: writers (engine-out -> Postgres).
+include("engine", "replayer", "loadtest", "host", "api", "writers")

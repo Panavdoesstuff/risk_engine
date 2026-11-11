@@ -17,11 +17,9 @@ public record ApiProperties(
         @NotBlank String jwtIssuer,
         @NotBlank String kafkaBootstrap,
         @NotBlank String eventsTopic,
-        @NotBlank String outTopic,
         @Min(1) int partitions,
         @NotNull @Valid RateLimit rateLimit,
         @NotNull Duration requestIdTtl,
-        @NotNull Duration orderTtl,
         @Min(1) long maxOrderQty) {
 
     /**

@@ -17,6 +17,8 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-security")
     implementation("org.springframework.boot:spring-boot-starter-oauth2-resource-server")
     implementation("org.springframework.boot:spring-boot-starter-data-redis")
+    implementation("org.springframework.boot:spring-boot-starter-jdbc")
+    runtimeOnly("org.postgresql:postgresql")
 
     testImplementation(testFixtures(project(":engine")))
     testImplementation("org.springframework.boot:spring-boot-starter-test")
@@ -24,6 +26,16 @@ dependencies {
     testImplementation(platform("org.testcontainers:testcontainers-bom:1.21.4"))
     testImplementation("org.testcontainers:junit-jupiter")
     testImplementation("org.testcontainers:redpanda")
+    testImplementation("org.testcontainers:postgresql")
+    testImplementation(project(":writers")) {
+        exclude(group = "org.slf4j", module = "slf4j-simple")
+    }
+    testImplementation("org.flywaydb:flyway-core")
+    testRuntimeOnly("org.flywaydb:flyway-database-postgresql")
+}
+
+tasks.withType<Test>().configureEach {
+    systemProperty("migrations.dir", rootDir.resolve("db/migrations").absolutePath)
 }
 
 tasks.withType<JavaCompile>().configureEach {

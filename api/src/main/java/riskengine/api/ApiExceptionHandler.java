@@ -44,8 +44,8 @@ class ApiExceptionHandler {
     }
 
     /**
-     * Redis or Redpanda is unreachable. The API fails closed: without Redis there is no rate limit and no
-     * replay protection, and without the log there is nowhere to put the order.
+     * Redis, Postgres or Redpanda is unreachable. The API fails closed: without Redis there is no rate
+     * limit and no replay protection, and without the log there is nowhere to put the order.
      */
     @ExceptionHandler({DataAccessException.class, EventLogUnavailableException.class})
     ResponseEntity<ApiError> dependencyDown(Exception e) {

@@ -9,6 +9,7 @@ import java.util.SplittableRandom;
 import java.util.TreeMap;
 import riskengine.events.Event;
 import riskengine.events.Fill;
+import riskengine.events.OrderClosed;
 import riskengine.events.OrderRequest;
 import riskengine.events.SquareOffResult;
 import riskengine.events.Tick;
@@ -106,6 +107,9 @@ public final class Fixtures {
                     out.add(new OrderRequest("O" + t + "-" + f, accountId, ins.get(r.nextInt(ins.size())).id(),
                             (t + f) % 2 == 0 ? OrderRequest.Side.BUY : OrderRequest.Side.SELL, 25L * (1 + (t * 7 + f) % 40),
                             OrderRequest.Origin.USER, time));
+                    // Every third order is closed again straight away (releasing its reservation if it was
+                    // accepted); again without drawing a random number.
+                    if ((t * 7 + f) % 3 == 0) out.add(new OrderClosed("O" + t + "-" + f, accountId, OrderClosed.Reason.CANCELLED, time));
                     continue;
                 }
                 if (kind < 10) {

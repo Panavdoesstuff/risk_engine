@@ -1,6 +1,6 @@
 # Architecture
 
-*Filled in as milestones land. Current state: M4 part 1 (shards on Redpanda, order API, security). Postgres writers, broker and square-off are not built yet.*
+*Filled in as milestones land. Current state: M4 (shards on Redpanda, order API, security, Postgres writers). The broker and square-off are M5.*
 
 ```
 replayer ──ticks (every partition, global tick_seq)──▶ engine-events[0..N-1] ──▶ ShardRunner × N
@@ -61,16 +61,15 @@ A fill updates the position, cash and vector at once (same bookkeeping code as t
 
 `stateHash()` is SHA-256 over the sorted state with doubles hashed bit-for-bit. Same log in, same hash out. `DeterminismRulesTest` keeps clocks, randomness, hash-ordered collections and platform-dependent maths out of the packages a shard executes.
 
-## Shards on Redpanda and the order API (M4 part 1)
+## Shards on Redpanda, the order API and the Postgres projection (M4)
 
 ```
 client ──POST /orders (JWT, X-Request-Id)──▶ api ──OrderRequest──▶ engine-events[hash(account) % N]
-   ▲                                          │                           │
-   │                                          │ Redis: rate limit,        ▼
-   └──GET /orders/{id}── order status (Redis) │ request ids,        ShardRunner p (host)
-                              ▲               │ order status          pre-trade check
-                              │                                           │
-                        engine-out listener ◀── engine-out[p] ◀── DECISION / MARGIN lines
+   ▲                                          │                           ▲            │
+   │                          Redis: rate limit, request ids     replayer: ticks       ▼
+   │                          Postgres: PENDING row              (every partition)  ShardRunner p (host)
+   │                                                                                 pre-trade check,
+   └──GET /orders/{id}── Postgres ◀── writers (batched) ◀── engine-out[p] ◀───────── margin, positions
 ```
 
 **A request, in order.** Each step can refuse; nothing later runs if it does.
@@ -83,24 +82,55 @@ client ──POST /orders (JWT, X-Request-Id)──▶ api ──OrderRequest─
 | Body and `X-Request-Id` well formed | controller | 400 |
 | Trader owns the account | controller | 403 |
 | Request id not used before by this user | `ReplayGuard` → Redis `SET NX EX` | 409 |
+| Account and instrument exist (PENDING row inserted) | `OrderRepository` → Postgres foreign keys | 422 |
 | Written to the account's partition, acknowledged | `RedpandaLogs` | 503 |
 | | | **202** + order id |
 
-**Then the shard decides.** The order is one more event in the account's partition. When the shard thread reaches it, the account's state is exactly "everything before this order in the log", so the margin check needs no lock. It prices the trade at the mark from the latest tick, counts earlier accepted-but-unfilled orders as filled (reservations), and publishes `ACCEPTED` or `REJECTED` with a reason. The API's listener copies the decision into the order's status.
+**Then the shard decides.** The order is one more event in the account's partition. When the shard thread reaches it, the account's state is exactly "everything before this order in the log", so the margin check needs no lock. It prices the trade at the mark from the latest tick, counts earlier accepted-but-unfilled orders as filled (reservations), and publishes `ACCEPTED` or `REJECTED` with a reason. A fill releases the part of the reservation it filled; an `OrderClosed` event releases the rest.
 
-**`host`.** `ShardHost` builds N `ShardState`s (each with the accounts that hash to it), gives each a `RedpandaEventLog` for its partition and starts N `ShardRunner` threads. Outputs go to the same-numbered partition of `engine-out`. If a shard cannot apply an event it stops and the host exits; it never skips. On start it replays from offset 0 (snapshots are M6), which reproduces the same state hash and republishes the same lines.
+**What a shard publishes** (`engine-out`, shard p → partition p, one text line each, plus a `source-offset` header):
 
-**Run it locally.**
+| Line | When | Written to Postgres as |
+| --- | --- | --- |
+| `MARGIN` | an account's level changes on a tick | `margin_events`, `audit_log` |
+| `DECISION` | an order was checked | `orders.status` ACCEPTED / REJECTED, `audit_log` |
+| `POSITION` | a fill changed a position | `positions`, `accounts.cash_balance` |
+| `RELEASED` | an order was closed | `orders.status` CANCELLED / BROKER_REJECTED, `audit_log` |
+
+**`writers`.** Poll a batch → one transaction → commit Postgres → commit Kafka offsets. `engine-out` is at-least-once (a restarted shard replays from offset 0 and publishes everything again), so inserts have unique keys and updates only apply if their source offset is newer than the row's `last_event_seq`. Replaying the whole topic changes nothing.
+
+**`host`.** `ShardHost` builds N `ShardState`s (each with the accounts that hash to it), gives each a `RedpandaEventLog` for its partition and starts N `ShardRunner` threads. If a shard cannot apply an event it stops and the host exits; it never skips. Per-shard lag (partition end − applied offset) is served at `:9100/metrics`; `/healthz` is 503 once a shard has stopped.
+
+**Run it.**
 
 ```bash
-docker compose up -d
-export JWT_SECRET=<at least 32 characters>
-./gradlew :host:run --args="--instruments data/processed/instruments-2024-06-03.csv --book data/seed"
-./gradlew :api:bootRun
+./scripts/m4-e2e.sh        # everything below, with synthetic data, in a throwaway compose project; checks each step
+```
+
+By hand, with a book under `./data` (see data/README.md):
+
+```bash
+docker compose --profile app up -d --build      # infrastructure + book loader, shard host, writers, API
+R=replayer/build/install/replayer/bin/replayer  # ./gradlew :replayer:installDist
+$R ticks --bars data/processed/NIFTY-1m.csv --vix data/processed/INDIAVIX.csv \
+         --from 2024-06-04 --to 2024-06-04 --redpanda localhost:19092 --pace-ms 200
+export JWT_SECRET=local-dev-only-jwt-secret-do-not-deploy-0123456789   # the compose default
 TOKEN=$(./gradlew -q :api:devToken --args="trader alice A0000001")
 curl -i -X POST localhost:8080/orders -H "Authorization: Bearer $TOKEN" -H "X-Request-Id: $(uuidgen)" \
      -H "Content-Type: application/json" \
      -d '{"accountId":"A0000001","instrumentId":"NIFTY-20240627-FUT","side":"BUY","qty":25}'
+curl -s localhost:9100/metrics | grep lag
 ```
 
-Orders are rejected with `NO_MARKET` until at least one tick is in the log. Writing ticks to Redpanda from the replayer is not wired up yet (it writes files); the tests write them directly.
+Orders are rejected with `NO_MARKET` until at least one tick is in the log.
+
+## The stress harness (M4)
+
+```
+8 writer threads ──orders, fills, closes, duplicates (80% on 20 hot accounts)──▶ 4 partitions ──▶ 4 live shards ──▶ outputs
+1 tick thread ────every tick to every partition──────────────────────────────▶      │
+                                                                                     ▼ read back afterwards
+                                     single-threaded reference engine ◀── tick, then each partition's events up to the next tick
+```
+
+Compared: every output in order, every account's final state, and each live shard's hash against a single-threaded replay. `./gradlew :loadtest:stress` (add `--args="--redpanda host:port"` to run it through a broker).

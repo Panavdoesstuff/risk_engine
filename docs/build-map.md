@@ -110,19 +110,19 @@ Start `docs/decisions.md` on day one. Write one short entry every time you choos
 
 ### M4 — Shards, orders and security
 
-> **Part 1 (done):** shards on Redpanda, the asynchronous order API, security. New `host` module (not in the layout above): Redpanda `EventLog`, `engine-out` publisher, one shard thread per partition. Accepted orders reserve margin until filled. See decisions.md #45–#61. **Part 2 (to do):** Postgres writers, the 1M-event stress harness, per-shard lag metric.
+> **Part 1:** shards on Redpanda, the asynchronous order API, security. New `host` module (not in the layout above): Redpanda `EventLog`, `engine-out` publisher, one shard thread per partition. Accepted orders reserve margin until filled or closed. See decisions.md #45–#61. **Part 2:** `OrderClosed` event, Postgres writers, the 1M-event stress harness, per-shard lag metric, the engine in docker compose with an end-to-end script (#62–#71).
 
 - [x] Partitioning: `hash(accountId) % N`; orders and fills keyed by account
-- [x] Order API (Spring Boot) **is asynchronous:** it validates, writes `OrderRequest` to the account's partition, returns `202 Accepted` with an order id. The shard does the pre-trade margin check and emits accept/reject to `engine-out`; the client sees the result via `GET /orders/{id}` or WebSocket *(GET only so far)*. (Say this in the README; interviewers will ask how a pre-trade check works without locks.)
+- [x] Order API (Spring Boot) **is asynchronous:** it validates, writes `OrderRequest` to the account's partition, returns `202 Accepted` with an order id. The shard does the pre-trade margin check and emits accept/reject to `engine-out`; the client sees the result via `GET /orders/{id}` or WebSocket *(GET only so far; it reads the order's row in Postgres)*. (Say this in the README; interviewers will ask how a pre-trade check works without locks.)
 - [x] JWT with roles `trader` (own account only) and `risk-ops` (view all, block/unblock, manual square-off) *(risk-ops can view all orders; block/unblock and manual square-off wait for M5, when shards have account status)*
 - [x] Redis token-bucket rate limit per user → 429
 - [x] Request-id replay protection (Redis set with TTL) → reject repeats *(409, with the original order id)*
-- [x] Input validation; parameterised SQL only *(no SQL exists yet; applies to part 2's writers)*
-- [ ] `engine-out` topic; batched Postgres writers for positions, margin events, audit log *(shards publish to `engine-out`; writers are part 2)*
-- [ ] Concurrency stress harness: interleave ticks, orders and fills on hot accounts; compare with a single-threaded reference run
-- [ ] Per-shard lag metric
+- [x] Input validation; parameterised SQL only
+- [x] `engine-out` topic; batched Postgres writers for positions, margin events, audit log *(and order status; account status, fills and the ledger wait for M5)*
+- [x] Concurrency stress harness: interleave ticks, orders and fills on hot accounts; compare with a single-threaded reference run *(`./gradlew :loadtest:stress`; also order closes and duplicates)*
+- [x] Per-shard lag metric *(`:9100/metrics` on the shard host)*
 
-**Gate:** 1M interleaved events → 0 mismatches; security tests return 401, 403, 429 and replay rejection. *(Security half passed in part 1; the 1M-event half is part 2.)*
+**Gate:** 1M interleaved events → 0 mismatches; security tests return 401, 403, 429 and replay rejection. **Passed.**
 
 ### M5 — Square-off pipeline
 

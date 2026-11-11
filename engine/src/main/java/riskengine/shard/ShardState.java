@@ -14,6 +14,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import riskengine.events.Fill;
 import riskengine.events.LoggedEvent;
+import riskengine.events.OrderClosed;
 import riskengine.events.OrderRequest;
 import riskengine.events.SquareOffResult;
 import riskengine.events.Tick;
@@ -27,9 +28,11 @@ import riskengine.margin.MarginLevel;
 import riskengine.margin.MarginResult;
 import riskengine.margin.MarginStatusTracker;
 import riskengine.margin.MarketState;
+import riskengine.margin.OrderClosure;
 import riskengine.margin.OrderDecision;
 import riskengine.margin.PendingOrder;
 import riskengine.margin.Position;
+import riskengine.margin.PositionChange;
 import riskengine.margin.PositionAccounting;
 import riskengine.margin.PreTradeCheck;
 import riskengine.margin.RiskArray;
@@ -70,6 +73,30 @@ public final class ShardState {
         final TreeMap<String, Integer> heldPerUnderlying = new TreeMap<>();
         /** Accepted orders waiting for fills, by order id. Their margin is reserved (see PreTradeCheck). */
         final TreeMap<String, PendingOrder> pending = new TreeMap<>();
+        /**
+         * Net reserved quantity per instrument: the sum of {@code pending}, kept up to date as orders are
+         * accepted, filled and closed, so a pre-trade check does not have to walk every open order.
+         * Derived from {@code pending} (which is hashed), so it is not hashed itself.
+         */
+        final TreeMap<String, Long> reservedNet = new TreeMap<>();
+
+        void reserve(String orderId, PendingOrder p) {
+            pending.put(orderId, p);
+            addReserved(p.instrumentId(), p.remaining());
+        }
+
+        /** Sets what is left of an order's reservation; 0 removes it. */
+        void setRemaining(String orderId, PendingOrder p, long left) {
+            addReserved(p.instrumentId(), left - p.remaining());
+            if (left == 0) pending.remove(orderId);
+            else pending.put(orderId, new PendingOrder(p.instrumentId(), left));
+        }
+
+        private void addReserved(String instrumentId, long delta) {
+            long now = reservedNet.getOrDefault(instrumentId, 0L) + delta;
+            if (now == 0) reservedNet.remove(instrumentId);
+            else reservedNet.put(instrumentId, now);
+        }
         final MarginStatusTracker tracker;
         MarginResult latest;
 
@@ -160,7 +187,8 @@ public final class ShardState {
 
     /**
      * Applies the next event. Offsets must arrive in order with no gaps. Returns what the shard has to say
-     * about it: level changes for a tick, the pre-trade decision for an order.
+     * about it: level changes for a tick, the pre-trade decision for an order, the new position for a
+     * fill, the release for a closed order.
      */
     public List<EngineOutput> apply(LoggedEvent le) {
         if (le.offset() != nextOffset) {
@@ -168,11 +196,9 @@ public final class ShardState {
         }
         List<EngineOutput> out = switch (le.event()) {
             case Tick t -> onTick(t);
-            case Fill f -> {
-                onFill(f);
-                yield List.of();
-            }
+            case Fill f -> onFill(f);
             case OrderRequest o -> onOrder(o);
+            case OrderClosed c -> onClosed(c);
             case SquareOffResult s -> List.of(); // square-off pipeline arrives in M5
         };
         nextOffset++;
@@ -220,10 +246,10 @@ public final class ShardState {
         return events;
     }
 
-    private void onFill(Fill f) {
+    private List<EngineOutput> onFill(Fill f) {
         if (!seenFillIds.add(f.fillId())) {
             duplicateFills++;
-            return;
+            return List.of();
         }
         Account a = accounts.get(f.accountId());
         if (a == null) throw new IllegalStateException("fill " + f.fillId() + " for account " + f.accountId() + " which shard " + shardId + " does not own");
@@ -261,11 +287,21 @@ public final class ShardState {
         PendingOrder p = a.pending.get(f.orderId());
         if (p != null && p.instrumentId().equals(i.id())) {
             // This fill belongs to an accepted order: release that much of its reservation.
-            long left = PreTradeCheck.remainingAfterFill(p.remaining(), f.qty());
-            if (left == 0) a.pending.remove(f.orderId());
-            else a.pending.put(f.orderId(), new PendingOrder(p.instrumentId(), left));
+            a.setRemaining(f.orderId(), p, PreTradeCheck.remainingAfterFill(p.remaining(), f.qty()));
         }
         if (fullyPriced(a)) a.latest = margin(a);
+        return List.of(new PositionChange(a.id, i.id(), now.qty(), now.avgPrice(), a.cash, f.fillId(), f.logTimeMillis()));
+    }
+
+    /**
+     * The order is finished without (fully) filling: release what it still had reserved. Closing an order
+     * with nothing reserved is not an error; it is acknowledged with released = 0.
+     */
+    private List<EngineOutput> onClosed(OrderClosed c) {
+        Account a = accounts.get(c.accountId());
+        PendingOrder p = a == null ? null : a.pending.get(c.orderId());
+        if (p != null) a.setRemaining(c.orderId(), p, 0);
+        return List.of(new OrderClosure(c.orderId(), c.accountId(), c.reason(), p == null ? 0 : p.remaining(), c.logTimeMillis()));
     }
 
     // ---------------------------------------------------------------- pre-trade check
@@ -296,7 +332,7 @@ public final class ShardState {
         MarginResult before = whatIf(a, null, 0);
         MarginResult after = whatIf(a, i.id(), qty);
         boolean ok = PreTradeCheck.passes(before, after, cfg.thresholds());
-        if (ok) a.pending.put(o.orderId(), new PendingOrder(i.id(), qty));
+        if (ok) a.reserve(o.orderId(), new PendingOrder(i.id(), qty));
         return List.of(OrderDecision.checked(o, ok, lastTickSeq, after));
     }
 
@@ -308,7 +344,14 @@ public final class ShardState {
         TreeMap<String, AccountVector> vectors = new TreeMap<>();
         for (AccountVector v : a.vectors.values()) vectors.put(v.underlying(), v.copy());
         BigDecimal cash = a.cash;
-        for (var d : PreTradeCheck.netDeltas(a.pending.values(), extraInstrumentId, extraQty).entrySet()) {
+        // The reserved quantities per instrument, plus the extra order. (The reference engine gets the same
+        // numbers by adding up every open order each time.)
+        TreeMap<String, Long> deltas = a.reservedNet;
+        if (extraInstrumentId != null) {
+            deltas = new TreeMap<>(a.reservedNet);
+            deltas.merge(extraInstrumentId, extraQty, Long::sum);
+        }
+        for (var d : deltas.entrySet()) {
             if (d.getValue() == 0) continue;
             Instrument i = instruments.get(d.getKey());
             String u = i.underlying();

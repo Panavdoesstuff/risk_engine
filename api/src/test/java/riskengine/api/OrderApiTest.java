@@ -12,6 +12,9 @@ import com.nimbusds.jose.crypto.MACSigner;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
 import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDate;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -21,35 +24,43 @@ import java.util.Date;
 import java.util.List;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.redpanda.RedpandaContainer;
 import riskengine.api.security.Caller.Role;
 import riskengine.api.security.JwtTokens;
 import riskengine.events.EventLog;
 import riskengine.events.LoggedEvent;
+import riskengine.events.OrderClosed;
 import riskengine.events.OrderRequest;
 import riskengine.events.Tick;
 import riskengine.host.RedpandaLogs;
 import riskengine.host.ShardHost;
 import riskengine.host.Topics;
 import riskengine.margin.AccountBook;
+import riskengine.ref.InstrumentCsv;
+import riskengine.writers.BookLoader;
+import riskengine.writers.EngineOutWriter;
 import riskengine.shard.Fixtures;
 import riskengine.shard.ShardConfig;
 
 /**
  * The whole path, with nothing mocked: the real Spring Security filter chain, a real Redis (rate limit,
- * replay guard, order status), a real Redpanda broker, and real shards doing the pre-trade check.
+ * replay guard), a real Redpanda broker, real shards doing the pre-trade check, and the real writers
+ * putting the result into a real Postgres with the real migrations.
  * Needs Docker.
  *
  * <p>Every test uses its own user ids, so one test's rate-limit bucket and request ids never affect another.
@@ -65,12 +76,15 @@ class OrderApiTest {
 
     static final RedpandaContainer REDPANDA = new RedpandaContainer("docker.redpanda.com/redpandadata/redpanda:v24.2.7");
     static final GenericContainer<?> REDIS = new GenericContainer<>("redis:7.4-alpine").withExposedPorts(6379);
+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16.4");
     static final ShardHost SHARDS;
     static final RedpandaLogs LOGS;
+    static final EngineOutWriter WRITER;
 
     static {
         REDPANDA.start();
         REDIS.start();
+        POSTGRES.start();
         String bootstrap = REDPANDA.getBootstrapServers();
         Topics.ensure(bootstrap, Topics.ENGINE_EVENTS, PARTITIONS);
         Topics.ensure(bootstrap, Topics.ENGINE_OUT, PARTITIONS);
@@ -78,6 +92,22 @@ class OrderApiTest {
                 new AccountBook("A-RICH", new BigDecimal("5000000"), BigDecimal.ZERO, new TreeMap<>()),
                 new AccountBook("A-POOR", new BigDecimal("20000"), BigDecimal.ZERO, new TreeMap<>()),
                 new AccountBook("A-VICTIM", new BigDecimal("5000000"), BigDecimal.ZERO, new TreeMap<>()));
+        // Postgres: the real migrations, then the same book the shards start from.
+        try {
+            Flyway.configure().dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())
+                    .locations("filesystem:" + System.getProperty("migrations.dir")).load().migrate();
+            Path dir = Files.createTempDirectory("api-test-book");
+            InstrumentCsv.write(dir.resolve("instruments.csv"), Fixtures.instruments());
+            StringBuilder accounts = new StringBuilder("account_id,archetype,thin_funded,cash_balance\n");
+            for (AccountBook b : books) accounts.append(b.id()).append(",TEST,false,").append(b.cash().toPlainString()).append('\n');
+            Files.writeString(dir.resolve("accounts.csv"), accounts);
+            Files.writeString(dir.resolve("positions.csv"), "account_id,instrument_id,lots,qty,avg_price\n");
+            BookLoader.load(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword(), dir.resolve("instruments.csv"), dir, LocalDate.of(2024, 6, 3));
+        } catch (Exception e) {
+            throw new ExceptionInInitializerError(e);
+        }
+        WRITER = new EngineOutWriter(bootstrap, Topics.ENGINE_OUT, POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+        WRITER.start();
         SHARDS = new ShardHost(bootstrap, PARTITIONS, Fixtures.CFG, ShardConfig.defaults(), Fixtures.instruments(), books);
         SHARDS.start();
         LOGS = new RedpandaLogs(bootstrap, Topics.ENGINE_EVENTS, PARTITIONS, Duration.ofMillis(300));
@@ -92,6 +122,9 @@ class OrderApiTest {
         r.add("api.partitions", () -> PARTITIONS);
         r.add("api.rate-limit.capacity", () -> BURST);
         r.add("api.rate-limit.refill-per-second", () -> 5);
+        r.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        r.add("spring.datasource.username", POSTGRES::getUsername);
+        r.add("spring.datasource.password", POSTGRES::getPassword);
         r.add("spring.data.redis.host", REDIS::getHost);
         r.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
     }
@@ -99,12 +132,15 @@ class OrderApiTest {
     @AfterAll
     static void stop() {
         assertNull(SHARDS.failure(), "no request, however malformed, may stop a shard");
+        assertEquals(0, WRITER.failedBatches(), "the writers never had to retry a batch");
         LOGS.close();
         SHARDS.close();
+        WRITER.close();
     }
 
     @Autowired MockMvc mvc;
     @Autowired ObjectMapper json;
+    @Autowired JdbcTemplate jdbc;
 
     static final AtomicInteger SEQ = new AtomicInteger();
 
@@ -412,12 +448,16 @@ class OrderApiTest {
 
         JsonNode view = awaitDecision(orderId);
         assertEquals("ACCEPTED", view.path("status").asText(), view.toString());
-        assertEquals("OK", view.path("reason").asText());
         assertEquals("A-RICH", view.path("accountId").asText());
         assertEquals(CALL, view.path("instrumentId").asText());
         assertEquals("SELL", view.path("side").asText());
         assertEquals(25, view.path("qty").asLong());
-        assertTrue(view.path("requiredAfter").decimalValue().signum() > 0, view.toString());
+        assertTrue(view.path("reason").isMissingNode() || view.path("reason").isNull(), "no reason on an accepted order: " + view);
+
+        // The same decision, straight from Postgres: the order row and one audit row.
+        assertEquals("ACCEPTED", jdbc.queryForObject("SELECT status FROM orders WHERE id = ?", String.class, orderId));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM audit_log WHERE request_id = ? AND action = 'ORDER_ACCEPTED' "
+                + "AND account_id = 'A-RICH' AND (details->>'requiredAfter')::numeric > 0", Integer.class, orderId));
 
         OrderRequest inLog = ordersInLog("A-RICH").stream().filter(o -> o.orderId().equals(orderId)).findFirst().orElseThrow();
         assertEquals(OrderRequest.Origin.USER, inLog.origin(), "the API can only ever write USER orders");
@@ -432,16 +472,45 @@ class OrderApiTest {
         assertEquals("REJECTED", noMargin.path("status").asText(), noMargin.toString());
         assertEquals("INSUFFICIENT_MARGIN", noMargin.path("reason").asText());
 
-        // Well-formed but wrong: not a whole number of lots, an instrument that is not listed, an account
-        // the engine has never heard of. The API answers 202 to all three; the shard says no.
+        // Well-formed but not a whole number of lots: the API answers 202, the shard says no.
         String rich = trader(newUser(), "A-RICH");
         JsonNode lots = awaitDecision(body(submit(rich, newRequestId(), order("A-RICH", CALL, "BUY", 30))).path("orderId").asText());
+        assertEquals("REJECTED", lots.path("status").asText(), lots.toString());
         assertEquals("BAD_LOT_SIZE", lots.path("reason").asText(), lots.toString());
-        JsonNode unlisted = awaitDecision(body(submit(rich, newRequestId(), order("A-RICH", "NIFTY-20240613-99900-CE", "BUY", 25))).path("orderId").asText());
-        assertEquals("UNKNOWN_INSTRUMENT", unlisted.path("reason").asText(), unlisted.toString());
-        String ghost = trader(newUser(), "A-GHOST");
-        JsonNode nobody = awaitDecision(body(submit(ghost, newRequestId(), sellOneLot("A-GHOST"))).path("orderId").asText());
-        assertEquals("UNKNOWN_ACCOUNT", nobody.path("reason").asText(), nobody.toString());
-        assertEquals("REJECTED", nobody.path("status").asText());
+    }
+
+    @Test
+    void anOrderForAnAccountOrInstrumentThatDoesNotExistIs422AndNeverReachesTheLog() throws Exception {
+        String rich = trader(newUser(), "A-RICH");
+        String requestId = newRequestId();
+        assertRefused(submit(rich, requestId, order("A-RICH", "NIFTY-20240613-99900-CE", "BUY", 25)), 422, "unknown_account_or_instrument");
+        // Nothing was created, so the same request id is still free for the corrected order.
+        assertEquals(202, submit(rich, requestId, order("A-RICH", CALL, "BUY", 25)).getStatus());
+
+        // A validly signed token for an account that does not exist.
+        assertRefused(submit(trader(newUser(), "A-GHOST"), newRequestId(), sellOneLot("A-GHOST")), 422, "unknown_account_or_instrument");
+        assertTrue(ordersInLog("A-GHOST").isEmpty());
+        assertTrue(ordersInLog("A-RICH").stream().noneMatch(o -> o.instrumentId().contains("99900")));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM orders WHERE instrument_id LIKE '%99900%' OR account_id = 'A-GHOST'", Integer.class));
+    }
+
+    @Test
+    void closingAnAcceptedOrderShowsUpAsCancelled() throws Exception {
+        String token = trader(newUser(), "A-RICH");
+        String orderId = body(submit(token, newRequestId(), sellOneLot("A-RICH"))).path("orderId").asText();
+        assertEquals("ACCEPTED", awaitDecision(orderId).path("status").asText());
+
+        // What M5's broker side will write when an accepted order ends without filling.
+        LOGS.append(new OrderClosed(orderId, "A-RICH", OrderClosed.Reason.CANCELLED, System.currentTimeMillis()));
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        JsonNode view;
+        do {
+            Thread.sleep(250);
+            view = body(send(get("/orders/" + orderId), token));
+        } while (!view.path("status").asText().equals("CANCELLED") && System.nanoTime() < deadline);
+        assertEquals("CANCELLED", view.path("status").asText(), view.toString());
+        assertEquals("CANCELLED", view.path("reason").asText());
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM audit_log WHERE request_id = ? AND action = 'ORDER_CLOSED' "
+                + "AND (details->>'released')::int = -25", Integer.class, orderId), "the release of its 25 reserved units is audited");
     }
 }

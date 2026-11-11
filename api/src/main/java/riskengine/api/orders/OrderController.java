@@ -5,6 +5,7 @@ import java.net.URI;
 import java.time.Clock;
 import java.util.Map;
 import java.util.regex.Pattern;
+import org.springframework.dao.DataAccessException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -32,6 +33,7 @@ import riskengine.host.RedpandaLogs.EventLogUnavailableException;
  *   <li>validates the body and the X-Request-Id header (400);</li>
  *   <li>checks the trader owns the account (403);</li>
  *   <li>claims the request id (409 if it was used before);</li>
+ *   <li>records the order as PENDING in Postgres (422 if the account or instrument does not exist);</li>
  *   <li>writes an OrderRequest to the account's partition of engine-events and waits for the broker to
  *       acknowledge it (503 if it does not);</li>
  *   <li>answers 202 Accepted with the order id.</li>
@@ -39,7 +41,7 @@ import riskengine.host.RedpandaLogs.EventLogUnavailableException;
  *
  * 202 means "written to the log", not "accepted by risk". The shard that owns the account runs the
  * pre-trade margin check when it reaches the order, in line with that account's fills and the market's
- * ticks, and publishes the decision; GET /orders/{id} shows it. No lock is held anywhere: the partition's
+ * ticks, and publishes the decision; the writers store it and GET /orders/{id} shows it. No lock is held anywhere: the partition's
  * order is the only ordering there is.
  */
 @RestController
@@ -48,14 +50,14 @@ class OrderController {
 
     private final ApiProperties props;
     private final ReplayGuard replayGuard;
-    private final OrderStore store;
+    private final OrderRepository orders;
     private final RedpandaLogs engineEvents;
     private final Clock clock;
 
-    OrderController(ApiProperties props, ReplayGuard replayGuard, OrderStore store, RedpandaLogs engineEvents, Clock clock) {
+    OrderController(ApiProperties props, ReplayGuard replayGuard, OrderRepository orders, RedpandaLogs engineEvents, Clock clock) {
         this.props = props;
         this.replayGuard = replayGuard;
-        this.store = store;
+        this.orders = orders;
         this.engineEvents = engineEvents;
         this.clock = clock;
     }
@@ -85,14 +87,19 @@ class OrderController {
 
         OrderRequest order = new OrderRequest(orderId, body.accountId(), body.instrumentId(), body.side(), body.qty(),
                 OrderRequest.Origin.USER, clock.millis());
-        store.pending(order);
         try {
+            if (!orders.insertPending(order, caller.userId(), caller.userId() + ":" + requestId)) {
+                // Not a replay and nothing was written, so the request id is free to use again.
+                replayGuard.release(caller.userId(), requestId);
+                throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "unknown_account_or_instrument",
+                        "the account or the instrument is not known");
+            }
             engineEvents.append(order);
-        } catch (EventLogUnavailableException e) {
+        } catch (EventLogUnavailableException | DataAccessException e) {
             // Unknown whether it landed. Give the request id back so the client can retry; the retry gets
             // the same order id, and the shard decides an order id once however many times it was written.
             replayGuard.release(caller.userId(), requestId);
-            store.forget(orderId);
+            if (e instanceof EventLogUnavailableException) orders.deleteIfStillPending(orderId);
             throw e;
         }
         return ResponseEntity.accepted().location(URI.create("/orders/" + orderId))
@@ -108,7 +115,7 @@ class OrderController {
         Caller caller = Caller.of(token);
         ApiException notFound = new ApiException(HttpStatus.NOT_FOUND, "not_found", "no such order");
         if (!OrderIds.looksLikeOne(orderId)) throw notFound;
-        OrderView view = store.find(orderId).orElseThrow(() -> notFound);
+        OrderView view = orders.find(orderId).orElseThrow(() -> notFound);
         if (!caller.mayRead(view.accountId())) throw notFound;
         return view;
     }

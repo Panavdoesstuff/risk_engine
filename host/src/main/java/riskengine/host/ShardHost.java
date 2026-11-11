@@ -26,7 +26,7 @@ import riskengine.shard.ShardState;
  *
  * <pre>
  *   ./gradlew :host:run --args="--instruments data/processed/instruments-2024-06-03.csv --book data/seed"
- *   optional: --bootstrap localhost:19092  --partitions 4
+ *   optional: --bootstrap localhost:19092  --partitions 4  --metrics-port 9100
  * </pre>
  */
 public final class ShardHost implements AutoCloseable {
@@ -35,6 +35,7 @@ public final class ShardHost implements AutoCloseable {
     private final List<EventLog> partitionLogs = new ArrayList<>();
     private final List<ShardRunner> runners = new ArrayList<>();
     private final List<Thread> threads = new ArrayList<>();
+    private final LagMonitor lag;
 
     public ShardHost(String bootstrap, int partitions, MarginConfig cfg, ShardConfig shardCfg,
                      Collection<Instrument> instruments, Collection<AccountBook> books) {
@@ -52,13 +53,20 @@ public final class ShardHost implements AutoCloseable {
             int shardId = p;
             EventLog log = logs.partition(p);
             partitionLogs.add(log);
-            runners.add(new ShardRunner(new ShardState(p, cfg, shardCfg, instruments, owned.get(p)), log, o -> out.publish(shardId, o)));
+            runners.add(ShardRunner.withOffsets(new ShardState(p, cfg, shardCfg, instruments, owned.get(p)), log,
+                    (offset, o) -> out.publish(shardId, offset, o)));
         }
+        this.lag = new LagMonitor(bootstrap, eventsTopic, runners);
     }
 
     public void start() {
         if (!threads.isEmpty()) throw new IllegalStateException("already started");
         for (ShardRunner r : runners) threads.add(r.startLive());
+    }
+
+    /** Per-shard lag, also served over HTTP by {@link LagMonitor#serve}. */
+    public LagMonitor lag() {
+        return lag;
     }
 
     public List<ShardRunner> runners() {
@@ -109,20 +117,21 @@ public final class ShardHost implements AutoCloseable {
                 interrupted = true;
             }
         }
+        lag.close();
         partitionLogs.forEach(EventLog::close);
         out.close();
         logs.close();
         if (interrupted) Thread.currentThread().interrupt();
     }
 
-    public static void main(String[] args) throws InterruptedException {
+    public static void main(String[] args) throws InterruptedException, java.io.IOException {
         TreeMap<String, String> f = new TreeMap<>();
         for (int i = 0; i + 1 < args.length; i += 2) {
             if (!args[i].startsWith("--")) break;
             f.put(args[i].substring(2), args[i + 1]);
         }
         if (args.length % 2 != 0 || f.size() * 2 != args.length || !f.containsKey("instruments") || !f.containsKey("book")) {
-            System.err.println("usage: host --instruments FILE --book DIR [--bootstrap localhost:19092] [--partitions 4]");
+            System.err.println("usage: host --instruments FILE --book DIR [--bootstrap localhost:19092] [--partitions 4] [--metrics-port 9100]");
             System.exit(2);
         }
         String bootstrap = f.getOrDefault("bootstrap", "localhost:19092");
@@ -133,6 +142,8 @@ public final class ShardHost implements AutoCloseable {
             Thread main = Thread.currentThread();
             Runtime.getRuntime().addShutdownHook(new Thread(main::interrupt));
             host.start();
+            int metricsPort = host.lag().serve(Integer.parseInt(f.getOrDefault("metrics-port", "9100")));
+            System.out.println("shard host: lag metrics on :" + metricsPort + "/metrics");
             System.out.println("shard host: " + partitions + " shards, " + books.size() + " accounts, " + instruments.size() + " instruments, reading " + bootstrap);
             try {
                 while (host.failure() == null) Thread.sleep(500);

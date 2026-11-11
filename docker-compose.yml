@@ -1,5 +1,14 @@
-# Local infrastructure for the risk engine.
-#   docker compose up -d        -> starts everything, applies migrations, creates topics
+# The risk engine on one machine.
+#
+#   docker compose up -d                  infrastructure only: Postgres (+ migrations), Redpanda (+ topics), Redis
+#   docker compose --profile app up -d    ... plus the engine: book loader, shard host, Postgres writers, order API
+#
+# The engine services need a start-of-day book under ./data (see data/README.md), which is why they are
+# behind a profile: the infrastructure must come up on a machine that has no data yet.
+# scripts/m4-e2e.sh runs the whole thing end to end with synthetic data.
+#
+# Host ports can be moved with POSTGRES_PORT, REDPANDA_PORT, REDPANDA_ADMIN_PORT, REDIS_PORT, API_PORT and
+# METRICS_PORT, so a second copy (docker compose -p other ...) can run beside this one.
 # Prometheus + Grafana are added in M6.
 
 name: risk-engine
@@ -13,7 +22,7 @@ services:
       POSTGRES_DB: risk
       POSTGRES_USER: risk
       POSTGRES_PASSWORD: risk
-    ports: ["5432:5432"]
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U risk -d risk"]
@@ -38,8 +47,8 @@ services:
       - --smp=1
       - --memory=1G
       - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
-      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
-    ports: ["19092:19092", "9644:9644"]
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:${REDPANDA_PORT:-19092}
+    ports: ["${REDPANDA_PORT:-19092}:19092", "${REDPANDA_ADMIN_PORT:-9644}:9644"]
     volumes: [redpanda:/var/lib/redpanda/data]
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
@@ -60,12 +69,82 @@ services:
 
   redis:
     image: redis:7.4-alpine
-    ports: ["6379:6379"]
+    ports: ["${REDIS_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 30
+
+  # ---------------------------------------------------------------- the engine (profile: app)
+
+  # Puts the start-of-day book (the same files the shard host reads) into Postgres, once.
+  book-loader:
+    profiles: [app]
+    build: .
+    image: risk-engine-app
+    command:
+      - /opt/writers/bin/writers
+      - load-book
+      - --instruments
+      - /data/${ENGINE_INSTRUMENTS:-processed/instruments-2024-06-03.csv}
+      - --book
+      - /data/${ENGINE_BOOK:-seed}
+      - --jdbc-url
+      - jdbc:postgresql://postgres:5432/risk
+    volumes: ["${DATA_DIR:-./data}:/data:ro"]
+    depends_on:
+      flyway: { condition: service_completed_successfully }
+    restart: "no"
+
+  # One shard thread per engine-events partition. Lag metrics at :9100/metrics, health at :9100/healthz.
+  shard-host:
+    profiles: [app]
+    image: risk-engine-app
+    command:
+      - /opt/host/bin/host
+      - --instruments
+      - /data/${ENGINE_INSTRUMENTS:-processed/instruments-2024-06-03.csv}
+      - --book
+      - /data/${ENGINE_BOOK:-seed}
+      - --bootstrap
+      - redpanda:9092
+      - --partitions
+      - "${ENGINE_PARTITIONS:-4}"
+      - --metrics-port
+      - "9100"
+    volumes: ["${DATA_DIR:-./data}:/data:ro"]
+    ports: ["${METRICS_PORT:-9100}:9100"]
+    depends_on:
+      book-loader: { condition: service_completed_successfully }
+      topic-init: { condition: service_completed_successfully }
+
+  # engine-out -> Postgres (positions, margin events, order status, audit log).
+  writers:
+    profiles: [app]
+    image: risk-engine-app
+    command: ["/opt/writers/bin/writers", "run", "--bootstrap", "redpanda:9092", "--jdbc-url", "jdbc:postgresql://postgres:5432/risk"]
+    depends_on:
+      book-loader: { condition: service_completed_successfully }
+      topic-init: { condition: service_completed_successfully }
+
+  api:
+    profiles: [app]
+    image: risk-engine-app
+    command: ["java", "-jar", "/opt/api/api.jar"]
+    environment:
+      # A fixed key is fine on a laptop and nowhere else: anyone who knows it can mint tokens.
+      # Set JWT_SECRET to something private for anything shared.
+      JWT_SECRET: ${JWT_SECRET:-local-dev-only-jwt-secret-do-not-deploy-0123456789}
+      KAFKA_BOOTSTRAP: redpanda:9092
+      ENGINE_PARTITIONS: ${ENGINE_PARTITIONS:-4}
+      REDIS_HOST: redis
+      DB_URL: jdbc:postgresql://postgres:5432/risk
+    ports: ["${API_PORT:-8080}:8080"]
+    depends_on:
+      book-loader: { condition: service_completed_successfully }
+      topic-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
 
 volumes:
   pgdata:

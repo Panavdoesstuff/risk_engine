@@ -37,6 +37,10 @@ $R ticks --bars data/processed/NIFTY-1m.csv --vix data/processed/INDIAVIX.csv \
          --from 2024-06-04 --to 2024-06-04 --partitions 4 --out data/processed/logs
 ```
 
+To write the ticks to Redpanda instead of files (for the engine in docker compose), replace `--partitions 4 --out ...` with `--redpanda localhost:19092`. It also refuses to run twice.
+
+**No real data yet?** `$R demo --out data/demo` writes SYNTHETIC instruments and bars (made-up prices) that the same commands accept; `scripts/m4-e2e.sh` uses them. Never quote results from them.
+
 With daily VIX, the VIX file must include 3 June: ticks on 4 June use the last value known at the time, which is 3 June's close.
 
 `bars` accepts a header with OPEN/HIGH/LOW/CLOSE plus DATETIME (or TIMESTAMP), or DATE + TIME, or DATE alone (daily). Timestamps without an offset are read as IST. Each output gets a `.meta` file with the resolution, row count, missing session minutes and a SHA-256.

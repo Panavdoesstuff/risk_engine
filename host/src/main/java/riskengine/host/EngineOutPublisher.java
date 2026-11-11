@@ -38,11 +38,22 @@ public final class EngineOutPublisher implements AutoCloseable {
         this.producer = new KafkaProducer<>(p);
     }
 
-    /** Called on a shard's thread. */
-    public void publish(int shardId, EngineOutput out) {
+    /** Record header carrying the offset (in engine-events, same partition) of the event that caused the output. */
+    public static final String SOURCE_OFFSET_HEADER = "source-offset";
+
+    /**
+     * Called on a shard's thread.
+     *
+     * @param sourceOffset offset of the causing event in the shard's engine-events partition. Unlike the
+     *                     record's own offset in engine-out, it is the same every time the log is
+     *                     replayed, so a consumer can refuse to let an old output overwrite a newer one.
+     */
+    public void publish(int shardId, long sourceOffset, EngineOutput out) {
         byte[] key = out.accountId().getBytes(StandardCharsets.UTF_8);
         byte[] value = EngineOutputCodec.encode(out).getBytes(StandardCharsets.UTF_8);
-        producer.send(new ProducerRecord<>(topic, shardId, key, value), (meta, ex) -> {
+        ProducerRecord<byte[], byte[]> record = new ProducerRecord<>(topic, shardId, key, value);
+        record.headers().add(SOURCE_OFFSET_HEADER, Long.toString(sourceOffset).getBytes(StandardCharsets.UTF_8));
+        producer.send(record, (meta, ex) -> {
             if (ex != null) failure.compareAndSet(null, ex);
         });
     }

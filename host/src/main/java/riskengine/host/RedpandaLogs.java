@@ -37,6 +37,7 @@ public final class RedpandaLogs implements AutoCloseable {
     private final int partitions;
     private final Duration pollWait;
     private final KafkaProducer<byte[], byte[]> producer;
+    private final java.util.concurrent.atomic.AtomicReference<Exception> asyncFailure = new java.util.concurrent.atomic.AtomicReference<>();
 
     /**
      * @param pollWait how long an empty {@code read} waits for new events before returning nothing
@@ -57,9 +58,6 @@ public final class RedpandaLogs implements AutoCloseable {
         p.put(ProducerConfig.ACKS_CONFIG, "all");
         p.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
         p.put(ProducerConfig.LINGER_MS_CONFIG, "0");
-        p.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, String.valueOf(SEND_TIMEOUT_MS));
-        p.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "5000");
-        p.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, String.valueOf(SEND_TIMEOUT_MS));
         this.producer = new KafkaProducer<>(p);
     }
 
@@ -87,12 +85,38 @@ public final class RedpandaLogs implements AutoCloseable {
         for (int p = 0; p < partitions; p++) send(p, t);
     }
 
+    /**
+     * Bulk writing (the replayer, the stress harness): hands the event to the producer and returns without
+     * waiting for the broker. Events sent to one partition from one thread keep their order. Call
+     * {@link #flush()} at the end; it throws if any of them was not written.
+     */
+    public void appendAsync(int partition, Event e) {
+        producer.send(record(partition, e), (meta, ex) -> {
+            if (ex != null) asyncFailure.compareAndSet(null, ex);
+        });
+    }
+
+    /** Async version of {@link #append(AccountEvent)}. */
+    public void appendAsync(AccountEvent e) {
+        appendAsync(partitionOf(e.accountId()), (Event) e);
+    }
+
+    /** Waits for every {@link #appendAsync} so far to be acknowledged. */
+    public void flush() {
+        producer.flush();
+        Exception ex = asyncFailure.get();
+        if (ex != null) throw new EventLogUnavailableException("an asynchronous write to " + topic + " failed", ex);
+    }
+
+    private ProducerRecord<byte[], byte[]> record(int partition, Event e) {
+        byte[] key = (e instanceof AccountEvent a ? a.accountId() : ((Tick) e).underlying()).getBytes(StandardCharsets.UTF_8);
+        return new ProducerRecord<>(topic, partition, key, EventCodec.encode(e).getBytes(StandardCharsets.UTF_8));
+    }
+
     /** Blocks until the broker has acknowledged the record. */
     long send(int partition, Event e) {
-        byte[] key = (e instanceof AccountEvent a ? a.accountId() : ((Tick) e).underlying()).getBytes(StandardCharsets.UTF_8);
-        byte[] value = EventCodec.encode(e).getBytes(StandardCharsets.UTF_8);
         try {
-            RecordMetadata m = producer.send(new ProducerRecord<>(topic, partition, key, value)).get(SEND_TIMEOUT_MS + 2_000, TimeUnit.MILLISECONDS);
+            RecordMetadata m = producer.send(record(partition, e)).get(SEND_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             return m.offset();
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();

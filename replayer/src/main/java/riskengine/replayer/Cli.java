@@ -40,10 +40,17 @@ public final class Cli {
                   with the margin engine at the as-of close, so it needs that day's India VIX close.
                   --spot defaults to the level implied by the near-month futures settle.
 
-              ticks        --bars FILE --vix FILE --out DIR [--partitions 4] [--underlying NIFTY]
-                           [--from YYYY-MM-DD] [--to YYYY-MM-DD]
+              ticks        --bars FILE --vix FILE (--out DIR | --redpanda HOST:PORT) [--partitions 4]
+                           [--underlying NIFTY] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--pace-ms 0]
                   Turn normalised bars (output of `bars`) into Tick events and write every tick to
-                  every partition log (partition-0.log ...). This is the only tick writer.
+                  every partition: log files in DIR (partition-0.log ...), or the engine-events topic
+                  on a Redpanda broker. This is the only tick writer, and it refuses to write twice.
+                  --pace-ms pauses between ticks when writing to Redpanda (for watching a replay).
+
+              demo         --out DIR
+                  Write SYNTHETIC inputs (made-up prices, not market data) so the whole pipeline can be
+                  run without the real files: an instruments file as of 2024-06-03, and raw minute bars
+                  and daily VIX for 3-4 June to feed to `bars`.
             """;
 
     private Cli() {}
@@ -60,6 +67,7 @@ public final class Cli {
                 case "bars" -> bars(f);
                 case "seed" -> seed(f);
                 case "ticks" -> ticks(f);
+                case "demo" -> System.out.print(riskengine.replayer.demo.DemoData.write(Path.of(req(f, "out"))));
                 default -> throw new IllegalArgumentException("unknown command " + args[0]);
             }
         } catch (IllegalArgumentException e) {
@@ -115,10 +123,18 @@ public final class Cli {
         var ticks = riskengine.replayer.ticks.TickBuilder.build(f.getOrDefault("underlying", "NIFTY"), bars, vix,
                 date(f, "from"), date(f, "to"), 1);
         int n = Integer.parseInt(f.getOrDefault("partitions", "4"));
-        Path dir = Path.of(req(f, "out"));
-        List<Path> files = riskengine.replayer.ticks.TickPublisher.publishToFiles(ticks, dir, n);
-        System.out.println("wrote " + ticks.size() + " ticks (tick_seq " + ticks.get(0).tickSeq() + ".." + ticks.get(ticks.size() - 1).tickSeq()
-                + ", VIX " + vix.resolution() + ") to each of " + files.size() + " partition logs in " + dir);
+        String what = "wrote " + ticks.size() + " ticks (tick_seq " + ticks.get(0).tickSeq() + ".." + ticks.get(ticks.size() - 1).tickSeq()
+                + ", VIX " + vix.resolution() + ") to each of " + n + " partition";
+        if (f.containsKey("redpanda") == f.containsKey("out")) throw new IllegalArgumentException("give exactly one of --out and --redpanda");
+        if (f.containsKey("redpanda")) {
+            riskengine.replayer.ticks.TickPublisher.publishToRedpanda(ticks, f.get("redpanda"), riskengine.host.Topics.ENGINE_EVENTS, n,
+                    Long.parseLong(f.getOrDefault("pace-ms", "0")));
+            System.out.println(what + "s of " + riskengine.host.Topics.ENGINE_EVENTS + " at " + f.get("redpanda"));
+        } else {
+            Path dir = Path.of(req(f, "out"));
+            riskengine.replayer.ticks.TickPublisher.publishToFiles(ticks, dir, n);
+            System.out.println(what + " logs in " + dir);
+        }
     }
 
     private static Map<String, String> flags(String[] a) {

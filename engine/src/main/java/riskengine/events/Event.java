@@ -6,11 +6,11 @@ package riskengine.events;
  *
  * <ul>
  *   <li>{@link Tick}: written to every partition by the replayer (the only tick writer).</li>
- *   <li>{@link OrderRequest}, {@link Fill}, {@link SquareOffResult}: written to the owning account's
+ *   <li>{@link OrderRequest}, {@link Fill}, {@link OrderClosed}, {@link SquareOffResult}: written to the owning account's
  *       partition only.</li>
  * </ul>
  */
-public sealed interface Event permits Tick, OrderRequest, Fill, SquareOffResult {
+public sealed interface Event permits Tick, OrderRequest, Fill, OrderClosed, SquareOffResult {
     long logTimeMillis();
 
     /** Fields are joined with '|' in the log, so identifiers must not contain it (or line breaks). */

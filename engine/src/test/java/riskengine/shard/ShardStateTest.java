@@ -21,7 +21,9 @@ import riskengine.events.LoggedEvent;
 import riskengine.events.Tick;
 import riskengine.margin.AccountBook;
 import riskengine.margin.EngineOutput;
+import riskengine.margin.OrderClosure;
 import riskengine.margin.OrderDecision;
+import riskengine.margin.PositionChange;
 import riskengine.margin.MarginEvent;
 import riskengine.margin.MarginResult;
 import riskengine.margin.Position;
@@ -77,6 +79,21 @@ class ShardStateTest {
                 assertClose(f.utilisationAfter(), s.utilisationAfter(), who + " utilisation after");
                 continue;
             }
+            if (full.get(i) instanceof PositionChange f) {
+                PositionChange s = (PositionChange) incremental.get(i);
+                String who = "fill " + f.fillId();
+                assertEquals(f.fillId(), s.fillId());
+                assertEquals(f.accountId(), s.accountId(), who);
+                assertEquals(f.instrumentId(), s.instrumentId(), who);
+                assertEquals(f.qty(), s.qty(), who);
+                assertEquals(0, f.avgPrice().compareTo(s.avgPrice()), who + " average price");
+                assertEquals(0, f.cash().compareTo(s.cash()), who + " cash");
+                continue;
+            }
+            if (full.get(i) instanceof OrderClosure f) {
+                assertEquals(f, incremental.get(i));
+                continue;
+            }
             MarginEvent f = (MarginEvent) full.get(i), s = (MarginEvent) incremental.get(i);
             assertEquals(f.accountId(), s.accountId());
             assertEquals(f.tickSeq(), s.tickSeq());
@@ -95,7 +112,7 @@ class ShardStateTest {
         ShardState shard = shard(0, books, new ShardConfig(7, 0.01)); // every account is rebuilt and checked once per 7 ticks
         ReferenceMarginEngine reference = new ReferenceMarginEngine(Fixtures.CFG, INS, books);
 
-        int transitions = 0, fills = 0, accepted = 0, rejected = 0;
+        int transitions = 0, fills = 0, accepted = 0, rejected = 0, released = 0;
         long offset = 0;
         for (Event e : events) {
             List<EngineOutput> full = reference.apply(e);
@@ -105,8 +122,10 @@ class ShardStateTest {
                 if (o instanceof OrderDecision d) {
                     if (d.accepted()) accepted++;
                     else rejected++;
-                } else {
+                } else if (o instanceof MarginEvent) {
                     transitions++;
+                } else if (o instanceof OrderClosure c && c.released() != 0) {
+                    released++;
                 }
             }
             if (e instanceof Fill) fills++;
@@ -123,6 +142,7 @@ class ShardStateTest {
         assertEquals((10_000 + 6) / 7, shard.maxRebuildsInOneTick(), "no spike: never more than ceil(n / K) accounts on one tick");
         assertTrue(shard.maxDriftSeen() < 1e-4, "drift " + shard.maxDriftSeen());
         assertTrue(accepted > 10 && rejected > 10, "pre-trade checks must go both ways: " + accepted + " accepted, " + rejected + " rejected");
+        assertTrue(released > 5, "some accepted orders are closed and release their reservation: " + released);
         System.out.printf("M3 gate: 10,000 portfolios, %d events (%d fills), %d level changes, %d orders accepted, %d rejected, max drift %.3e rupees%n",
                 events.size(), fills, transitions, accepted, rejected, shard.maxDriftSeen());
     }
@@ -142,13 +162,23 @@ class ShardStateTest {
 
     /**
      * Shards run in parallel, so their outputs have no order between them. Sort for comparison: level
-     * changes by (tick, account), then order decisions by order id.
+     * changes by (tick, account), then decisions by order id, position changes by fill id, closures by order id.
      */
     static final Comparator<EngineOutput> CANONICAL = Comparator
-            .comparing((EngineOutput o) -> o instanceof MarginEvent ? 0 : 1)
+            .comparing((EngineOutput o) -> switch (o) {
+                case MarginEvent m -> 0;
+                case OrderDecision d -> 1;
+                case PositionChange p -> 2;
+                case OrderClosure c -> 3;
+            })
             .thenComparing(o -> o instanceof MarginEvent m ? m.tickSeq() : 0L)
             .thenComparing(EngineOutput::accountId)
-            .thenComparing(o -> o instanceof OrderDecision d ? d.orderId() : "");
+            .thenComparing(o -> switch (o) {
+                case MarginEvent m -> "";
+                case OrderDecision d -> d.orderId();
+                case PositionChange p -> p.fillId();
+                case OrderClosure c -> c.orderId();
+            });
 
     static String replay(List<AccountBook> books, List<Event> events, ShardConfig cfg) {
         ShardState s = shard(3, books, cfg);

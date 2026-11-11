@@ -16,6 +16,19 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - run: ./gradlew build --no-daemon
 
+  m4-e2e:
+    # The whole path through docker compose: replayer ticks -> shards -> an order accepted -> visible in Postgres.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./scripts/m4-e2e.sh
+
   m1-gate:
     # Proves `docker compose up` works on a clean machine: schema, topics, ledger/audit constraints.
     runs-on: ubuntu-latest

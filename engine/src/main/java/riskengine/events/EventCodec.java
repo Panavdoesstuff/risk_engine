@@ -10,6 +10,7 @@ import java.math.BigDecimal;
  *   TICK|v1|tickSeq|logTimeMillis|underlying|spot|vix
  *   ORDER|v1|orderId|accountId|instrumentId|side|qty|origin|logTimeMillis
  *   FILL|v1|fillId|orderId|accountId|instrumentId|qty|price|logTimeMillis
+ *   CLOSED|v1|orderId|accountId|reason|logTimeMillis
  *   SQOFF|v1|legKey|accountId|instrumentId|status|logTimeMillis
  * </pre>
  */
@@ -24,6 +25,7 @@ public final class EventCodec {
                     + o.side() + "|" + o.qty() + "|" + o.origin() + "|" + o.logTimeMillis();
             case Fill f -> "FILL|v1|" + f.fillId() + "|" + f.orderId() + "|" + f.accountId() + "|" + f.instrumentId() + "|"
                     + f.qty() + "|" + f.price().toPlainString() + "|" + f.logTimeMillis();
+            case OrderClosed c -> "CLOSED|v1|" + c.orderId() + "|" + c.accountId() + "|" + c.reason() + "|" + c.logTimeMillis();
             case SquareOffResult s -> "SQOFF|v1|" + s.legKey() + "|" + s.accountId() + "|" + s.instrumentId() + "|"
                     + s.status() + "|" + s.logTimeMillis();
         };
@@ -43,6 +45,9 @@ public final class EventCodec {
                         break;
                     case "FILL":
                         if (f.length == 9) return new Fill(f[2], f[3], f[4], f[5], Long.parseLong(f[6]), new BigDecimal(f[7]), Long.parseLong(f[8]));
+                        break;
+                    case "CLOSED":
+                        if (f.length == 6) return new OrderClosed(f[2], f[3], OrderClosed.Reason.valueOf(f[4]), Long.parseLong(f[5]));
                         break;
                     case "SQOFF":
                         if (f.length == 7) return new SquareOffResult(f[2], f[3], f[4], SquareOffResult.Status.valueOf(f[5]), Long.parseLong(f[6]));

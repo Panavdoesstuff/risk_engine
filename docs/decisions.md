@@ -192,7 +192,7 @@ Why each part:
 
 **49. Accepted orders reserve margin until they fill.**
 Nothing has filled when the next order arrives, so a check against positions alone would pass two identical orders against the same free margin. Each accepted order is kept as a reservation (order id → instrument, remaining quantity); every later check treats reservations as already filled; a fill with that order id releases what it filled. Reservations do not affect the account's reported margin or level, only pre-trade checks. They are part of the state hash.
-*Open, needs a decision:* only fills release a reservation. If the broker rejects or cancels an accepted order, its margin stays reserved forever. That needs a new event (order closed without filling) when the broker arrives in M5. And until M5 nothing produces fills for accepted orders at all, so in a live run reservations only build up.
+*Resolved in part 2 (decision 62):* an `OrderClosed` event releases a reservation when an order ends without filling. Until M5's broker exists nothing writes fills or closes in a live run, so there reservations still only build up.
 
 **50. Orders the shard can't check are rejections with a reason, never exceptions.**
 Unknown account, unknown instrument, quantity that is not a whole number of lots, no tick yet: each is a `REJECTED` decision with a reason code. Decision 41 (stop on bad input) is for the log's own integrity (offset gaps, tick order). Anything a user can cause must not stop a shard. An order id seen before is ignored (decided once). Orders with origin `SQUARE_OFF` are the engine's own and still wait for M5.
@@ -221,11 +221,65 @@ Each user has a bucket of 20 tokens refilled at 10 a second *(both numbers are g
 **58. Replay protection: `SET request:{user}:{id} NX EX 24h`.**
 Every order needs an `X-Request-Id`. The first use claims it in one atomic Redis command; a repeat inside 24 hours is 409, with the id of the order it first created. Ids are per user, so nobody can use up someone else's. The same id with a different body is still a replay. After the 24 hours, a repeat would get the same order id (decision 54) and the shard would ignore it.
 
-**59. The API checks form; the shard checks meaning.**
+**59. The API checks form; the shard checks meaning.** *(Part 2 adds one check to the API: an unknown account or instrument is 422, see decision 65.)*
 API (400): strict JSON (unknown fields, `"25"` for 25 and 25.5 for a whole number are errors), narrow patterns for account and instrument ids, side, 1 ≤ qty ≤ 100,000. The patterns also guarantee that nothing a caller sends can contain the `|` or line breaks that separate fields and events in the log. Shard (rejection): does the account exist, is the instrument listed, is the quantity whole lots, is there margin. The API holds no reference data and never computes margin. Callers can't set the order id or the origin. Error bodies never contain class names or parser messages.
 
-**60. Order status for GET /orders/{id} lives in Redis for now.**
+**60. Order status for GET /orders/{id} lives in Redis for now.** *(Superseded by decision 65: it is read from Postgres and the Redis store is gone.)*
 The API writes PENDING (only if no status is there); a listener on `engine-out` writes the decision (always). Whichever lands first, a decision is never overwritten by PENDING. Records expire after 7 days. This is a convenience view, not a record; part 2's Postgres writers produce the durable `orders` rows, and the endpoint could read from there instead.
 
 **61. The Redpanda and API tests run against real containers; nothing is mocked.**
 Testcontainers starts the same Redpanda image as docker-compose, plus Redis. The API tests go through the real Spring Security filter chain, real Redis scripts, a real broker and real shards. They need Docker (CI has it). *Cost:* about a minute of test time.
+
+## M4 part 2: OrderClosed, Postgres writers, the stress harness, lag, docker compose
+
+**62. `OrderClosed` releases a reservation when an order ends without filling.**
+A fifth event type, `CLOSED|v1|orderId|accountId|reason|logTime`, with reason UNFILLED, REJECTED or CANCELLED, written to the account's partition. The shard removes whatever that order still had reserved and answers with how much it released. M5's broker side will write it; today the stress harness and tests do.
+- Closing an order that has nothing reserved (already filled, never accepted, closed before, unknown) releases 0 and is not an error, so the event can be delivered twice.
+- A partly filled order releases only the unfilled part.
+- A fill that arrives after the close still changes the position, because the trade happened, and releases nothing.
+
+**63. Two more outputs, and every output says which event caused it.**
+`POSITION|v1|…` (a fill changed a position: the new quantity, average price and cash) and `RELEASED|v1|…` (the answer to an `OrderClosed`). Each `engine-out` record also carries a `source-offset` header: the offset, in the account's `engine-events` partition, of the event that caused it. The record's own offset in `engine-out` grows every time a shard replays; the source offset is the same on every replay, which is what makes decision 64 work.
+
+**64. The Postgres writers: batch, commit the database first, and make every statement safe to run twice.**
+One loop: poll up to 2,000 records → one database transaction → commit it → commit the Kafka offsets. If the process dies between the two commits the batch is read and written again, so every statement has to be harmless the second time:
+- *Rows inserted once* have a unique key and `ON CONFLICT DO NOTHING`: `margin_events (account_id, tick_seq)`, and a new `audit_log.event_key` (`DECISION:<order>`, `MARGIN:<account>:<tick>`, `CLOSED:<order>:<offset>`).
+- *Rows that are updated* (positions, account cash, order status) carry `last_event_seq`, the source offset that last wrote them, and only accept a strictly newer one. Without this, a restarted shard replaying its history would briefly put old positions back.
+- Migration V3 adds `accounts.last_event_seq`, `orders.last_event_seq` and `audit_log.event_key`. `positions.last_event_seq` already existed; V1 described it as an engine-out offset, and it now holds the source offset, for the reason in decision 63.
+- A row that would break a foreign key (an account or instrument Postgres has never seen) is skipped and counted, and its audit row is still written without the account link. One bad row must not block the stream.
+- Utilisation is capped at 999999.9999 in `margin_events`, because NUMERIC(10,4) can't hold the infinity the engine uses when nothing is available.
+- All SQL is parameterised. No framework: a Kafka consumer and JDBC batches.
+- *Tested:* after a run the tables equal the reference engine's positions, cash and order statuses account by account; then the shard host is restarted, republishes all 1,063 outputs, and not one projected value changes.
+- *Not written yet:* `accounts.status`, `fills` and the ledger. Those belong to M5 (the status state machine, broker fills, double entry).
+
+**65. Order status is read from Postgres; the Redis status store is gone.** *(Replaces #60.)*
+The API inserts the order as PENDING just before writing it to the log (`ON CONFLICT DO NOTHING`); the writers set ACCEPTED / REJECTED, and later CANCELLED / BROKER_REJECTED on a close. `last_event_seq = -1` marks a row the engine has not decided yet, so a decision can never be overwritten by PENDING. Redis now holds only rate-limit buckets and request ids.
+- *Side effect, a change from part 1:* the `orders` table has foreign keys to accounts and instruments, so an order naming something that doesn't exist can't be inserted. The API answers **422** and writes nothing to the log (the request id is given back). In part 1 such orders got 202 and a shard rejection. The shard still rejects them if they reach it some other way.
+- `GET /orders/{id}` returns the order row. The margin numbers behind a decision are in `audit_log.details`.
+- *Cost:* the API now needs Postgres to accept an order, where before it needed only Redis and Redpanda. If Postgres is down the API answers 503.
+
+**66. The stress harness races real threads, then lets the log say what happened.**
+Eight writer threads append orders, fills, closes and duplicates for the same 20 hot accounts (80% of events) while another thread writes ticks to every partition and four shard threads consume live. Nobody coordinates, so the order of records in a partition is decided by the race, as in production.
+- *How the reference gets the same input:* afterwards the harness reads back what each partition actually holds and feeds the single-threaded reference engine "tick, then every partition's account events up to the next tick". Events in different partitions belong to different accounts, so their relative order can't matter; each account's own order and where the ticks fall in it are preserved.
+- *What is compared:* every output of every shard, one by one and in order (level changes, decisions and reasons, position changes, releases); every account's final positions, cash, level, reservations and margin; and each live shard's state hash against a single-threaded replay of its recorded partition.
+- *Tolerance:* money to a millionth of a rupee, because the shard updates incrementally and the reference rebuilds (decision 38). Everything else must be identical.
+- *It can fail:* a test hides one fill from the reference and checks that the harness reports mismatches.
+- *Result:* 1,000,000 records, 0 mismatches, on in-memory logs and again through a real Redpanda broker. Numbers in results.md.
+- *What it does not cover:* the Postgres writers. They are tested separately (decision 64) on about a thousand outputs, not a million.
+
+**67. The shard keeps a running net reservation per instrument; the reference adds up every open order each time.**
+The first 1M run took 60 seconds, because each pre-trade check walked every open order of the account and hot accounts had thousands. The shard now keeps, per account, the net reserved quantity per instrument, updated when an order is accepted, filled or closed. The same run takes 4.5 seconds. The reference engine was deliberately left adding them up from scratch, so the two engines reach the reservation total by different routes and the harness compares them. (The reference did get one harmless speed-up: it prices each instrument once per tick instead of once per order.)
+
+**68. Per-shard lag = partition end offset − the shard's applied offset.**
+It is the number that says whether a shard is keeping up. A background thread asks the broker for the end offsets twice a second with its own consumer, so measuring never gets in a shard's way. The shard host serves the numbers as Prometheus text at `:9100/metrics` (`risk_shard_lag_events`, `risk_shard_applied_offset`, `risk_shard_log_end_offset`, `risk_shard_up`) and `/healthz` turns 503 once a shard has stopped. It uses the JDK's built-in HTTP server; M6 points Prometheus at it. The two offsets are read a moment apart, so it is a gauge, not an exact count.
+
+**69. docker compose: the engine is behind the `app` profile, in one image.**
+`docker compose up -d` still starts only the infrastructure, because that has to work on a machine with no data yet (the M1 gate). `docker compose --profile app up -d` adds a one-shot book loader, the shard host, the writers and the API, all from one image built by the Dockerfile (Gradle runs inside the build, so only Docker is needed). They read the book from `./data`.
+- Host ports are variables, so a second copy can run beside the first. `scripts/m4-e2e.sh` uses that: it runs as its own compose project on its own ports and volumes and deletes them afterwards, never touching the default stack.
+- The compose file gives the API a fixed development JWT secret if `JWT_SECRET` is not set. That is fine on a laptop and nowhere else; the API itself still has no default.
+
+**70. The replayer writes ticks to Redpanda, once.**
+`replayer ticks --redpanda host:port` writes every tick to every partition of `engine-events`. It first reads the partitions and refuses if any already holds a tick: a second copy would break "tick_seq strictly increases" and stop every shard. `--pace-ms` slows it down for watching.
+
+**71. `replayer demo` writes synthetic inputs, clearly marked.**
+The real 3–4 June files aren't in the repo yet, and the end-to-end run needs a book and ticks. `replayer demo` writes an instruments file priced by the engine's own Black-Scholes and raw minute bars with a made-up fall of about 8%, then the normal `bars`, `seed` and `ticks` commands run on them. Every file says SYNTHETIC. Nothing produced from it may be quoted as a result about 4 June 2024.

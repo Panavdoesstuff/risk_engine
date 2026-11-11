@@ -10,6 +10,7 @@ out/
 data/raw/
 data/processed/
 data/seed/
+data/demo/
 !data/README.md
 
 # jqwik failure database (local test state)

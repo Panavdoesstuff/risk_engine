@@ -33,7 +33,9 @@ class EventLogTest {
         assertEquals("ORDER|v1|O-1|A0000001|NIFTY-20240613-23000-CE|SELL|50|USER|111", EventCodec.encode(order));
         assertEquals("FILL|v1|BF-9|O-1|A0000001|NIFTY-20240613-23000-CE|-50|266.70|222", EventCodec.encode(fill));
         assertEquals("SQOFF|v1|A0000001:E1:NIFTY-20240613-23000-CE:0|A0000001|NIFTY-20240613-23000-CE|REJECTED|333", EventCodec.encode(sq));
-        for (Event e : List.of(order, fill, sq, tick(1, "23000"))) assertEquals(e, EventCodec.decode(EventCodec.encode(e)));
+        Event closed = new OrderClosed("O-1", "A0000001", OrderClosed.Reason.CANCELLED, 444);
+        assertEquals("CLOSED|v1|O-1|A0000001|CANCELLED|444", EventCodec.encode(closed));
+        for (Event e : List.of(order, fill, closed, sq, tick(1, "23000"))) assertEquals(e, EventCodec.decode(EventCodec.encode(e)));
     }
 
     @Test

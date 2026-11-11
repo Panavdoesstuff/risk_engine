@@ -214,6 +214,55 @@ class RedpandaShardsTest {
         }
     }
 
+    @Test
+    void lagIsTheNumberOfEventsAShardHasNotAppliedYet() throws Exception {
+        Topics.ensure(bootstrap, "lag-events", 2);
+        Topics.ensure(bootstrap, "lag-out", 2);
+        try (RedpandaLogs writer = new RedpandaLogs(bootstrap, "lag-events", 2, Duration.ofMillis(100))) {
+            // 40 events are waiting in partition 0 before any shard exists; partition 1 is empty.
+            for (int i = 1; i <= 40; i++) writer.appendAsync(0, tick(i, "23300"));
+            writer.flush();
+            try (ShardHost host = new ShardHost(bootstrap, "lag-events", "lag-out", 2, Fixtures.CFG, ShardConfig.defaults(),
+                    Fixtures.instruments(), Fixtures.books(20, 1))) {
+                LagMonitor lag = host.lag();
+                assertEquals(40, lag.lag(0), "not started yet: everything is lag");
+                assertEquals(0, lag.lag(1));
+                assertEquals(40, lag.maxLag());
+                int port = lag.serve(0);
+                assertTrue(http(port, "/metrics").body().contains("risk_shard_lag_events{shard=\"0\"} 40\n"), http(port, "/metrics").body());
+
+                host.start();
+                host.awaitCaughtUp(Duration.ofSeconds(30));
+                long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+                while (lag.maxLag() != 0 && System.nanoTime() < deadline) Thread.sleep(50);
+                String metrics = http(port, "/metrics").body();
+                for (String line : List.of("risk_shard_lag_events{shard=\"0\"} 0", "risk_shard_lag_events{shard=\"1\"} 0",
+                        "risk_shard_applied_offset{shard=\"0\"} 40", "risk_shard_log_end_offset{shard=\"0\"} 40",
+                        "risk_shard_up{shard=\"0\"} 1", "# TYPE risk_shard_lag_events gauge")) {
+                    assertTrue(metrics.contains(line + "\n"), "missing: " + line + "\n" + metrics);
+                }
+                assertEquals(200, http(port, "/healthz").statusCode());
+
+                // A shard that stops on an event it cannot apply shows up as down, and its lag stops falling.
+                writer.appendToAll(tick(40, "23300")); // tick_seq does not increase
+                writer.appendToAll(tick(41, "23300"));
+                deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+                while (http(port, "/healthz").statusCode() == 200 && System.nanoTime() < deadline) Thread.sleep(50);
+                assertEquals(503, http(port, "/healthz").statusCode());
+                deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+                while (lag.lag(0) != 2 && System.nanoTime() < deadline) Thread.sleep(50);
+                metrics = http(port, "/metrics").body();
+                assertTrue(metrics.contains("risk_shard_up{shard=\"0\"} 0\n") && metrics.contains("risk_shard_lag_events{shard=\"0\"} 2\n"), metrics);
+            }
+        }
+    }
+
+    static java.net.http.HttpResponse<String> http(int port, String path) throws Exception {
+        return java.net.http.HttpClient.newHttpClient().send(
+                java.net.http.HttpRequest.newBuilder(java.net.URI.create("http://localhost:" + port + path)).build(),
+                java.net.http.HttpResponse.BodyHandlers.ofString());
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /** Reads until {@code count} events have arrived (a single read may return fewer than are available). */
