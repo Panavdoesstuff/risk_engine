@@ -36,19 +36,31 @@ import riskengine.shard.ShardState;
  * <pre>
  *   ./gradlew :host:run --args="--instruments data/processed/instruments-2024-06-03.csv --book data/seed"
  *   optional: --bootstrap localhost:19092  --partitions 4  --metrics-port 9100
- *             --snapshot-dir DIR  --snapshot-every-seconds 60  --only 0,2
+ *             --snapshot-dir DIR  --snapshot-every-seconds 60  --snapshot-min-ticks 50  --only 0,2
  * </pre>
  */
 public final class ShardHost implements AutoCloseable {
 
     /**
+     * A shard snapshots after a tick when both hold: at least {@code snapshotEveryMillis} of log time and at
+     * least {@code snapshotMinTicks} ticks since its last snapshot. Both are counted from the log, never
+     * from a clock. The tick minimum matters in a replay of minute bars, where log time moves 60 s per
+     * tick: without it, M = 60 s would mean a snapshot on every tick.
+     *
      * @param only                shards to run, or null for all
      * @param snapshots           where snapshots live, or null for none (replay from 0 on every start)
      * @param snapshotEveryMillis log time between snapshots of one shard
+     * @param snapshotMinTicks    ticks between snapshots of one shard, at least
      */
-    public record Options(SortedSet<Integer> only, SnapshotStore snapshots, long snapshotEveryMillis) {
+    public record Options(SortedSet<Integer> only, SnapshotStore snapshots, long snapshotEveryMillis, int snapshotMinTicks) {
+        public static final int DEFAULT_MIN_TICKS = 50;
+
+        public Options(SortedSet<Integer> only, SnapshotStore snapshots, long snapshotEveryMillis) {
+            this(only, snapshots, snapshotEveryMillis, DEFAULT_MIN_TICKS);
+        }
+
         public static Options defaults() {
-            return new Options(null, null, 60_000);
+            return new Options(null, null, 60_000, DEFAULT_MIN_TICKS);
         }
     }
 
@@ -125,13 +137,16 @@ public final class ShardHost implements AutoCloseable {
             runners.add(runner);
             tickMetrics.activate(p);
             long[] lastSnapshotAt = {lastSnapshotTime(state)};
+            long[] ticksSince = {0};
             runner.observe(e -> {
                 tickMetrics.applied(shardId, e);
                 if (options.snapshots() != null && e.event() instanceof Tick t) {
                     // Every M seconds of log time, after a tick: the state is between events here.
+                    ticksSince[0]++;
                     if (lastSnapshotAt[0] == Long.MIN_VALUE) {
                         lastSnapshotAt[0] = t.logTimeMillis();
-                    } else if (t.logTimeMillis() - lastSnapshotAt[0] >= options.snapshotEveryMillis()) {
+                    } else if (t.logTimeMillis() - lastSnapshotAt[0] >= options.snapshotEveryMillis() && ticksSince[0] >= options.snapshotMinTicks()) {
+                        ticksSince[0] = 0;
                         long start = System.nanoTime();
                         ShardState.SnapshotImage image = state.capture(); // the only part on the shard's thread
                         tickMetrics.snapshotTaken(shardId, System.nanoTime() - start);
@@ -281,7 +296,7 @@ public final class ShardHost implements AutoCloseable {
         }
         if (args.length % 2 != 0 || f.size() * 2 != args.length || !f.containsKey("instruments") || !f.containsKey("book")) {
             System.err.println("usage: host --instruments FILE --book DIR [--bootstrap localhost:19092] [--partitions 4] [--metrics-port 9100]\n"
-                    + "            [--snapshot-dir DIR] [--snapshot-every-seconds 60] [--only 0,2]");
+                    + "            [--snapshot-dir DIR] [--snapshot-every-seconds 60] [--snapshot-min-ticks 50] [--only 0,2]");
             System.exit(2);
         }
         String bootstrap = f.getOrDefault("bootstrap", "localhost:19092");
@@ -294,7 +309,8 @@ public final class ShardHost implements AutoCloseable {
             for (String s : f.get("only").split(",")) only.add(Integer.parseInt(s.trim()));
         }
         SnapshotStore store = f.containsKey("snapshot-dir") ? new SnapshotStore(Path.of(f.get("snapshot-dir")), 3) : null;
-        Options options = new Options(only, store, (long) (Double.parseDouble(f.getOrDefault("snapshot-every-seconds", "60")) * 1000));
+        Options options = new Options(only, store, (long) (Double.parseDouble(f.getOrDefault("snapshot-every-seconds", "60")) * 1000),
+                Integer.parseInt(f.getOrDefault("snapshot-min-ticks", String.valueOf(Options.DEFAULT_MIN_TICKS))));
         ShardHost host = new ShardHost(bootstrap, Topics.ENGINE_EVENTS, Topics.ENGINE_OUT, partitions, MarginConfig.defaults(), ShardConfig.defaults(),
                 instruments, books, options);
         Thread main = Thread.currentThread();
@@ -313,7 +329,8 @@ public final class ShardHost implements AutoCloseable {
             int metricsPort = host.lag().serve(Integer.parseInt(f.getOrDefault("metrics-port", "9100")));
             System.out.println("shard host: lag metrics on :" + metricsPort + "/metrics");
             System.out.println("shard host: " + host.runners().size() + " of " + partitions + " shards, " + books.size() + " accounts, " + instruments.size()
-                    + " instruments, reading " + bootstrap + (store == null ? "" : "; snapshots in " + store.dir() + " every " + options.snapshotEveryMillis() / 1000.0 + " s of log time"));
+                    + " instruments, reading " + bootstrap + (store == null ? "" : "; snapshots in " + store.dir() + " every " + options.snapshotEveryMillis() / 1000.0 + " s of log time and "
+                    + options.snapshotMinTicks() + " ticks at least"));
             try {
                 while (host.failure() == null) Thread.sleep(500);
                 System.err.println("shard host stopping: " + host.failure());

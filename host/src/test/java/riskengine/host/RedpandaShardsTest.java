@@ -257,6 +257,28 @@ class RedpandaShardsTest {
         }
     }
 
+    @Test
+    void inAMinuteBarReplayTheTickMinimumKeepsSnapshotsFromHappeningOnEveryTick(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+        Topics.ensure(bootstrap, "snap-events", 1);
+        Topics.ensure(bootstrap, "snap-out", 1);
+        try (RedpandaLogs writer = new RedpandaLogs(bootstrap, "snap-events", 1, Duration.ofMillis(100))) {
+            // 120 ticks one minute of log time apart, as in a replay of minute bars.
+            for (int i = 1; i <= 120; i++) writer.appendAsync(0, new Tick(i, Fixtures.T0 + i * 60_000L, "NIFTY", new BigDecimal("23300"), new BigDecimal("20")));
+            writer.flush();
+            SnapshotStore store = new SnapshotStore(dir, 3);
+            try (ShardHost host = new ShardHost(bootstrap, "snap-events", "snap-out", 1, Fixtures.CFG, ShardConfig.defaults(), Fixtures.instruments(),
+                    Fixtures.books(20, 1), new ShardHost.Options(null, store, 60_000, 50))) {
+                host.start();
+                host.awaitCaughtUp(Duration.ofSeconds(30));
+                host.stop();
+                // M = 60 s alone would snapshot on 119 of the 120 ticks. With 50 ticks at least: after ticks 50 and 100.
+                assertEquals(2, host.tickMetrics().snapshotsTaken(0));
+            }
+            // The newest is on disk (an older one still waiting is replaced by a newer one from the same shard).
+            assertEquals(100L, new SnapshotStore(dir, 3).list(0).get(0).offset());
+        }
+    }
+
     static java.net.http.HttpResponse<String> http(int port, String path) throws Exception {
         return java.net.http.HttpClient.newHttpClient().send(
                 java.net.http.HttpRequest.newBuilder(java.net.URI.create("http://localhost:" + port + path)).build(),

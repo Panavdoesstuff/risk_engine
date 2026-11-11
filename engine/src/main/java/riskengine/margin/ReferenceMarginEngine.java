@@ -64,13 +64,20 @@ public final class ReferenceMarginEngine {
     private final SortedMap<String, Account> accounts = new TreeMap<>();
     private final SortedMap<String, ScenarioGrid> grids = new TreeMap<>();
     private final SortedMap<String, MarketState> markets = new TreeMap<>();
-    private final SortedSet<String> seenFillIds = new TreeSet<>();
-    private final SortedSet<String> seenOrderIds = new TreeSet<>();
+    private final SeenIds seenFillIds = new SeenIds();
+    private final SeenIds seenOrderIds = new SeenIds();
+    private final long dedupeWindowMillis;
     private long lastTickSeq = Long.MIN_VALUE;
     /** Risk arrays at the current market, filled in as they are needed and thrown away on every tick. */
     private SortedMap<String, RiskArray> arrays = new TreeMap<>();
 
     public ReferenceMarginEngine(MarginConfig cfg, Collection<Instrument> instruments, Collection<AccountBook> books) {
+        this(cfg, instruments, books, SeenIds.DEFAULT_WINDOW_MILLIS);
+    }
+
+    /** @param dedupeWindowMillis how long applied fill and order ids are remembered (must match the shards') */
+    public ReferenceMarginEngine(MarginConfig cfg, Collection<Instrument> instruments, Collection<AccountBook> books, long dedupeWindowMillis) {
+        this.dedupeWindowMillis = dedupeWindowMillis;
         this.cfg = cfg;
         for (Instrument i : instruments) this.instruments.put(i.id(), i);
         for (AccountBook b : books) {
@@ -103,7 +110,7 @@ public final class ReferenceMarginEngine {
 
     public List<EngineOutput> onOrder(OrderRequest o) {
         if (o.origin() != OrderRequest.Origin.USER) return List.of(); // the engine's own square-off orders: M5
-        if (!seenOrderIds.add(o.orderId())) return List.of();
+        if (!seenOrderIds.add(o.orderId(), seenTime(o.logTimeMillis()))) return List.of();
         Account a = accounts.get(o.accountId());
         if (a == null) return List.of(OrderDecision.rejected(o, OrderDecision.Reason.UNKNOWN_ACCOUNT, lastTickSeq));
         OrderDecision.Reason gate = a.risk.orderGate();
@@ -155,6 +162,9 @@ public final class ReferenceMarginEngine {
         lastTickSeq = t.tickSeq();
         UnderlyingParams p = cfg.params(t.underlying());
         markets.put(t.underlying(), new MarketState(t.underlying(), t.spot().doubleValue(), t.vix().doubleValue() * p.volScale(), t.logTimeMillis()));
+        long cutoff = latestTickLogTime() - dedupeWindowMillis;
+        seenFillIds.pruneBefore(cutoff);
+        seenOrderIds.pruneBefore(cutoff);
 
         arrays = new TreeMap<>(); // priced once per instrument per tick
         List<EngineOutput> events = new ArrayList<>();
@@ -227,7 +237,7 @@ public final class ReferenceMarginEngine {
     }
 
     public List<EngineOutput> onFill(Fill f) {
-        if (!seenFillIds.add(f.fillId())) return List.of();
+        if (!seenFillIds.add(f.fillId(), seenTime(f.logTimeMillis()))) return List.of();
         Account a = accounts.get(f.accountId());
         if (a == null) throw new IllegalStateException("fill " + f.fillId() + " for unknown account " + f.accountId());
         Instrument i = instrument(f.instrumentId(), f.accountId());
@@ -287,6 +297,23 @@ public final class ReferenceMarginEngine {
                 next = le.offset() + 1;
             }
         }
+    }
+
+    private long latestTickLogTime() {
+        long t = Long.MIN_VALUE;
+        for (MarketState m : markets.values()) t = Math.max(t, m.logTimeMillis());
+        return t;
+    }
+
+    /** Same rule as the shard: the latest tick's log time, or before any tick the event's own. */
+    private long seenTime(long eventLogTime) {
+        long t = latestTickLogTime();
+        return t == Long.MIN_VALUE ? eventLogTime : t;
+    }
+
+    /** Fill ids remembered for dedupe, with the log time each was seen at. */
+    public SortedMap<String, Long> seenFillIds() {
+        return seenFillIds.asMap();
     }
 
     public MarginResult latest(String accountId) {

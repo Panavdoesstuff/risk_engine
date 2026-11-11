@@ -200,8 +200,8 @@ public final class ShardState {
     private final TreeMap<String, RiskArray> arrays = new TreeMap<>();
     private final TreeMap<String, MarketState> markets = new TreeMap<>();
     private final TreeMap<String, ScenarioGrid> grids = new TreeMap<>();
-    private final TreeSet<String> seenFillIds = new TreeSet<>();
-    private final TreeSet<String> seenOrderIds = new TreeSet<>();
+    private final riskengine.margin.SeenIds seenFillIds = new riskengine.margin.SeenIds();
+    private final riskengine.margin.SeenIds seenOrderIds = new riskengine.margin.SeenIds();
 
     private long nextOffset;
     private long lastTickSeq = Long.MIN_VALUE;
@@ -282,6 +282,10 @@ public final class ShardState {
         UnderlyingParams p = cfg.params(u);
         MarketState m = new MarketState(u, t.spot().doubleValue(), t.vix().doubleValue() * p.volScale(), t.logTimeMillis());
         boolean firstTick = markets.put(u, m) == null;
+        // The dedupe window moves with log time: forget ids seen more than the window before this tick.
+        long cutoff = latestLogTime() - shardCfg.dedupeWindowMillis();
+        seenFillIds.pruneBefore(cutoff);
+        seenOrderIds.pruneBefore(cutoff);
         ScenarioGrid grid = grids.get(u);
 
         TreeSet<String> held = byUnderlying.get(u);
@@ -343,7 +347,7 @@ public final class ShardState {
     }
 
     private List<EngineOutput> onFill(Fill f) {
-        if (!seenFillIds.add(f.fillId())) {
+        if (!seenFillIds.add(f.fillId(), seenTime(f.logTimeMillis()))) {
             duplicateFills++;
             return List.of();
         }
@@ -440,7 +444,7 @@ public final class ShardState {
      */
     private List<EngineOutput> onOrder(OrderRequest o) {
         if (o.origin() != OrderRequest.Origin.USER) return List.of(); // square-off legs never enter as order events
-        if (!seenOrderIds.add(o.orderId())) {
+        if (!seenOrderIds.add(o.orderId(), seenTime(o.logTimeMillis()))) {
             duplicateOrders++; // the same request written twice (an API retry): decided once
             return List.of();
         }
@@ -646,7 +650,7 @@ public final class ShardState {
     // ---------------------------------------------------------------- snapshots
 
     private static final String SNAPSHOT_MAGIC = "RISK-SHARD-SNAPSHOT";
-    private static final int SNAPSHOT_VERSION = 2; // 2: decimals as unscaled long + scale
+    private static final int SNAPSHOT_VERSION = 3; // 2: decimals as unscaled long + scale; 3: seen ids with their log time, dedupe window
     private static final int CHECKSUM_BYTES = 32;
 
     /** A snapshot could not be used. The caller falls back to an older one, or to replaying from offset 0. */
@@ -780,7 +784,7 @@ public final class ShardState {
         }
         return new SnapshotImage(shardId, nextOffset, lastTickSeq, latestLogTime(), cfg.fingerprint(), shardCfg.rebuildCycleTicks(),
                 shardCfg.driftToleranceRupees(), instrumentIds, markets.values().toArray(new MarketState[0]), images,
-                seenFillIds.toArray(new String[0]), seenOrderIds.toArray(new String[0]),
+                seenFillIds.ids(), seenFillIds.times(), seenOrderIds.ids(), seenOrderIds.times(), shardCfg.dedupeWindowMillis(),
                 maxDriftSeen, accountRebuilds, maxRebuildsInOneTick, duplicateFills, duplicateOrders);
     }
 
@@ -795,12 +799,17 @@ public final class ShardState {
         private final String fingerprint;
         private final double tolerance, maxDriftSeen;
         private final String[] instrumentIds, seenFills, seenOrders;
+        private final long[] seenFillTimes, seenOrderTimes;
+        private final long dedupeWindow;
         private final MarketState[] markets;
         private final AccountImage[] accounts;
 
         SnapshotImage(int shardId, long nextOffset, long lastTickSeq, long logTime, String fingerprint, int k, double tolerance, String[] instrumentIds,
-                      MarketState[] markets, AccountImage[] accounts, String[] seenFills, String[] seenOrders, double maxDriftSeen, long accountRebuilds,
-                      int maxRebuildsInOneTick, long duplicateFills, long duplicateOrders) {
+                      MarketState[] markets, AccountImage[] accounts, String[] seenFills, long[] seenFillTimes, String[] seenOrders, long[] seenOrderTimes,
+                      long dedupeWindow, double maxDriftSeen, long accountRebuilds, int maxRebuildsInOneTick, long duplicateFills, long duplicateOrders) {
+            this.seenFillTimes = seenFillTimes;
+            this.seenOrderTimes = seenOrderTimes;
+            this.dedupeWindow = dedupeWindow;
             this.shardId = shardId;
             this.nextOffset = nextOffset;
             this.lastTickSeq = lastTickSeq;
@@ -842,6 +851,7 @@ public final class ShardState {
                 out.writeUTF(fingerprint);
                 out.writeInt(k);
                 out.writeDouble(tolerance);
+                out.writeLong(dedupeWindow);
 
                 TreeMap<String, Integer> index = new TreeMap<>();
                 out.writeInt(instrumentIds.length);
@@ -896,9 +906,15 @@ public final class ShardState {
                     }
                 }
                 out.writeInt(seenFills.length);
-                for (String id : seenFills) out.writeUTF(id);
+                for (int i = 0; i < seenFills.length; i++) {
+                    out.writeUTF(seenFills[i]);
+                    out.writeLong(seenFillTimes[i]);
+                }
                 out.writeInt(seenOrders.length);
-                for (String id : seenOrders) out.writeUTF(id);
+                for (int i = 0; i < seenOrders.length; i++) {
+                    out.writeUTF(seenOrders[i]);
+                    out.writeLong(seenOrderTimes[i]);
+                }
                 out.writeDouble(maxDriftSeen);
                 out.writeLong(accountRebuilds);
                 out.writeInt(maxRebuildsInOneTick);
@@ -910,6 +926,12 @@ public final class ShardState {
                 throw new IllegalStateException("cannot write snapshot", e);
             }
         }
+    }
+
+    /** The log time an id is remembered at: the latest tick's, or before any tick the event's own. */
+    private long seenTime(long eventLogTime) {
+        long t = latestLogTime();
+        return t == Long.MIN_VALUE ? eventLogTime : t;
     }
 
     /** Log time of the latest tick on any underlying; Long.MIN_VALUE before the first tick. */
@@ -974,9 +996,11 @@ public final class ShardState {
             if (!fingerprint.equals(cfg.fingerprint())) throw new SnapshotException("taken with a different margin config");
             int k = in.readInt();
             double tolerance = in.readDouble();
+            long window = in.readLong();
             if (k != shardCfg.rebuildCycleTicks() || tolerance != shardCfg.driftToleranceRupees()) {
                 throw new SnapshotException("taken with different drift-check settings (K " + k + ", tolerance " + tolerance + ")");
             }
+            if (window != shardCfg.dedupeWindowMillis()) throw new SnapshotException("taken with a different dedupe window (" + window + " ms)");
             TreeMap<String, Instrument> known = new TreeMap<>();
             for (Instrument i : instruments) known.put(i.id(), i);
             int n = in.readInt();
@@ -1053,9 +1077,9 @@ public final class ShardState {
                 a.latest = r.latest();
             }
             int fills = in.readInt();
-            for (int i = 0; i < fills; i++) s.seenFillIds.add(in.readUTF());
+            for (int i = 0; i < fills; i++) s.seenFillIds.add(in.readUTF(), in.readLong());
             int orders = in.readInt();
-            for (int i = 0; i < orders; i++) s.seenOrderIds.add(in.readUTF());
+            for (int i = 0; i < orders; i++) s.seenOrderIds.add(in.readUTF(), in.readLong());
             s.maxDriftSeen = in.readDouble();
             s.accountRebuilds = in.readLong();
             s.maxRebuildsInOneTick = in.readInt();
@@ -1118,10 +1142,13 @@ public final class ShardState {
                  .dbl(r.futuresMtm()).dbl(r.available()).dbl(r.utilisation());
             }
         }
-        h.num(seenFillIds.size());
-        for (String id : seenFillIds) h.str(id);
-        h.num(seenOrderIds.size());
-        for (String id : seenOrderIds) h.str(id);
+        // Seen ids with the log time each was first seen: both decide what is forgotten, and when.
+        for (riskengine.margin.SeenIds seen : List.of(seenFillIds, seenOrderIds)) {
+            String[] ids = seen.ids();
+            long[] times = seen.times();
+            h.num(ids.length);
+            for (int i = 0; i < ids.length; i++) h.str(ids[i]).num(times[i]);
+        }
         return h.hex();
     }
 
@@ -1242,6 +1269,15 @@ public final class ShardState {
     /** Most accounts rebuilt on any single tick: at most ceil(accounts / K), so there is no spike tick. */
     public int maxRebuildsInOneTick() {
         return maxRebuildsInOneTick;
+    }
+
+    /** Fill ids remembered for dedupe, with the log time each was seen at. */
+    public SortedMap<String, Long> seenFillIds() {
+        return seenFillIds.asMap();
+    }
+
+    public SortedMap<String, Long> seenOrderIds() {
+        return seenOrderIds.asMap();
     }
 
     public long duplicateFills() {

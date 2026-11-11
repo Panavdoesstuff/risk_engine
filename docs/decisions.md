@@ -466,7 +466,7 @@ What it measures is the API path (JWT check, Redis rate limit and replay guard, 
 - *Contents:* everything a shard knows (accounts, positions, vectors, reservations, the risk state, markets, seen fill and order ids, the next offset).
 - *Not stored:* risk arrays. They are recomputed from the markets on restore, and StrictMath gives the same bits.
 - *Encoding:* decimals as unscaled value plus scale, doubles by their exact bits, instruments as numbers into a table at the top.
-- *Where:* files in a directory (a compose volume), not the `engine_snapshots` table. That keeps the shard host free of Postgres, and a file write is easy to make atomic. *See the report.*
+- *Where:* files in a directory (a compose volume), not the `engine_snapshots` table. That keeps the shard host free of Postgres, and a file write is easy to make atomic. *(Kept, by your decision after M6 part 2; the table is unused, decision 110.)*
 
 **101. Recovery: the newest snapshot that passes every check, then replay from its offset.**
 A starting shard tries its snapshots newest first and takes the first that passes all of these:
@@ -507,3 +507,22 @@ After the Grafana fix, 10 runs still had 2 failures, both "Prometheus did not re
 
 *The bug was in the metric, not the script:* dropping fast samples hides exactly the ticks that are fastest, and biases the histogram upwards. Now a negative sample counts as 0 ms and increments `risk_tick_clock_skew_total`, so skew is visible; only a truly unknown send time is left out. The load-test numbers are not affected: `ScaleRun` and `RecoveryRun` time ticks with the same process's `System.nanoTime()`.
 *Cost:* in compose, tick-to-margin from the shard host's /metrics is only as good as the clocks of whoever writes ticks; for live data that is the market data feed's host. The load-test harness is the number to quote.
+
+## After M6: follow-ups
+
+**108. The M6 scale gate is accepted at 50 ticks/s on the development laptop.** *(Your call after M6 part 2.)*
+The build map's gate says "p99 < 50 ms at 100k accounts". On this fanless MacBook Air, that holds at 50 ticks/s, with snapshots on (two-minute runs: 15.7 and 35.8 ms). It does not hold reliably at 100 ticks/s (decision 105). 50 ticks/s is the number quoted in the README and results.
+
+**109. Snapshots: every 60 s of log time and at least 50 ticks.** *(Your call after M6 part 2.)*
+A shard snapshots after a tick when at least M = 60 s of log time *and* at least 50 ticks have passed since its last snapshot. Both are counted from the log, never from a clock, so where snapshots fall is deterministic. In a minute-bar replay, M alone would mean a snapshot on every tick (decision 104); with the minimum it is one every 50. M7's crash-day replay therefore takes about 7 captures instead of 375. Recovery's worst case grows to replaying 50 ticks or 60 s of log, whichever is longer: about 0.35 s of ticks at 25,000 accounts per shard, or 42 s of live ticks at 100 ticks/s. Configurable: `--snapshot-every-seconds`, `--snapshot-min-ticks` (compose: `SNAPSHOT_EVERY_SECONDS`, `SNAPSHOT_MIN_TICKS`).
+
+**110. Snapshots stay as files; the `engine_snapshots` table is unused.** *(Your call after M6 part 2.)*
+The table from V1 (`shard_id`, `partition_offset`, `tick_seq`, `log_time`, `state_hash`, `state_blob`) is left in the schema, but nothing reads or writes it. Snapshots are files on a volume (decision 100), which keeps the shard host independent of Postgres and makes a crash-safe write a simple rename. Dropping the table would need a migration; it's harmless, so it stays until there is a reason to touch it.
+
+**111. Seen fill and order ids are forgotten after two days of log time.** *(Your call after M6 part 2.)*
+Each id is stamped, when first seen, with the latest tick's log time (before any tick, with the event's own log time). On every tick, ids stamped more than two days before that tick are dropped. One class, `SeenIds`, does this for both the shard and the reference engine, so they forget at exactly the same tick.
+- *Deterministic:* stamps and cutoffs are log time, so two replays keep and drop the same ids.
+- *State:* the ids and their stamps are in the state hash (same ids seen at different times are different states, because they will be forgotten at different times) and in snapshots (format version 3). The window is part of `ShardConfig`, and a snapshot taken with a different window is refused.
+- *Effect:* the sets, and so snapshot sizes, stop growing with history; they hold about two days of ids.
+- *Cost:* a duplicate that arrives more than two days after the original is applied again. Broker duplicates arrive within seconds and API retries within minutes, so two days leaves a wide margin. Postgres keeps its own unique constraints (`fills.broker_fill_id`, the outbox key) with no window, so a very late duplicate fill would be refused there even though the shard would apply it.
+- *Tested:* inside the window a duplicate is ignored; just past it the id is forgotten and a repeat is applied, at the same tick in both engines; pruning is exact at the cutoff; five days of hourly ticks keep about two days of ids, with every in-window duplicate still caught and replays agreeing; a restored shard forgets on the same tick as the original.

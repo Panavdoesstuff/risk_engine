@@ -99,7 +99,8 @@ services:
     restart: "no"
 
   # One shard thread per engine-events partition. Lag metrics at :9100/metrics, health at :9100/healthz.
-  # Each shard snapshots every SNAPSHOT_EVERY_SECONDS of log time into the snapshots volume and, on start,
+  # Each shard snapshots every SNAPSHOT_EVERY_SECONDS of log time (and SNAPSHOT_MIN_TICKS ticks at least) into
+  # the snapshots volume and, on start,
   # carries on from its newest valid snapshot.
   shard-host:
     profiles: [app]
@@ -120,6 +121,8 @@ services:
       - /snapshots
       - --snapshot-every-seconds
       - "${SNAPSHOT_EVERY_SECONDS:-60}"
+      - --snapshot-min-ticks
+      - "${SNAPSHOT_MIN_TICKS:-50}"
     volumes: ["${DATA_DIR:-./data}:/data:ro", "snapshots:/snapshots"]
     ports: ["${METRICS_PORT:-9100}:9100"]
     depends_on:

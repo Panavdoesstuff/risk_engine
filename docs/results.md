@@ -5,7 +5,7 @@ Fill in as you go. Every number names the commit and command that produced it.
 | Metric | Value | Where it comes from |
 | --- | --- | --- |
 | Accounts | **100,000** × 5 positions, 4 shards | M6 scale run |
-| p99 tick-to-margin | **held at 50 ticks/s** (15.7 and 35.8 ms over 2-minute runs, snapshots on); hit or miss at 100 ticks/s on this laptop (see M6 part 2) | M6 scale runs |
+| p99 tick-to-margin | **under 50 ms at 50 ticks/s** (15.7 and 35.8 ms over 2-minute runs, snapshots on). **The gate is accepted at 50 ticks/s on this laptop**; 100 ticks/s does not hold reliably here | M6 scale runs |
 | Sustained ticks/s | **50** with p99 under 50 ms; flat-out bursts reach 105–127 for a few seconds | M6 scale runs |
 | Incremental speed-up | **27.4×** vs naive, **3.1×** vs full recompute (details below) | JMH / M3 |
 | Mismatches over 1M events | **0** (in-memory logs, and again through Redpanda; details below) | M4 harness |
@@ -30,6 +30,8 @@ Read this honestly: most of the 27× is "price each instrument once", which the 
 At this rate one shard handles roughly 700 ticks per second for 10,000 accounts. M6 measures the real target (100k accounts, p99).
 
 ## M6 part 2: recovery
+
+**Scale gate, as accepted:** p99 tick-to-margin under 50 ms at 100,000 accounts is held at **50 ticks/s** on the development laptop (a fanless MacBook Air M4), with snapshots on. At 100 ticks/s it is hit or miss here and is not claimed.
 
 ### Kill -9 under a chaos square-off (`ShardKillTest`, runs on every build)
 

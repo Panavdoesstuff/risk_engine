@@ -55,7 +55,7 @@ import riskengine.shard.ShardState;
  * M6 recovery gate: kill -9 shards in the middle of a square-off under full broker chaos.
  *
  * <p>Each shard runs as its own process (the real {@code ShardHost} main, {@code --only p}), snapshotting
- * every 5 minutes of log time (5 ticks here). While ticks, user orders and the chaos broker's fills flow,
+ * every 5 minutes of log time and 5 ticks (the production minimum is 50; lowered so a short run has many). While ticks, user orders and the chaos broker's fills flow,
  * a killer sends SIGKILL to a random shard process at random moments, at least five times, and starts it
  * again; each restart loads its newest valid snapshot and replays from there. Everything else (writers,
  * outbox relay, fill ingester, mock broker) keeps running, as it would in production.
@@ -166,7 +166,7 @@ class ShardKillTest {
             shards.add(new ShardProcess(p, List.of(java, "-Xmx512m", "-cp", System.getProperty("java.class.path"), "riskengine.host.ShardHost",
                     "--instruments", bookDir.resolve("instruments.csv").toString(), "--book", bookDir.toString(), "--bootstrap", bootstrap,
                     "--partitions", String.valueOf(N), "--metrics-port", "0", "--snapshot-dir", snapshots.toString(),
-                    "--snapshot-every-seconds", "300", "--only", String.valueOf(p)), logs));
+                    "--snapshot-every-seconds", "300", "--snapshot-min-ticks", "5", "--only", String.valueOf(p)), logs));
         }
 
         MockBroker.Chaos chaos = new MockBroker.Chaos(0.05, 0.02, 0.10, 120, 450, 20240604L);

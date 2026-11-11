@@ -145,7 +145,7 @@ Start `docs/decisions.md` on day one. Write one short entry every time you choos
 
 ### M6 — Scale and recovery (go/no-go)
 
-> **Part 1 (scale) and part 2 (recovery) done** (decisions.md #87–#106). *Caveat on the p99 gate, decision 105:* held at 50 ticks/s; at 100 ticks/s hit or miss on the development laptop. Also done here, as follow-ups approved after M5: fills stamped with replay time, several outbox relays with `FOR UPDATE SKIP LOCKED`.
+> **Done** (decisions.md #87–#111). **The p99 gate is accepted at 50 ticks/s on the development laptop** (decision 108): held there with snapshots on; 100 ticks/s does not hold reliably on this machine. Also done here, as follow-ups approved after M5: fills stamped with replay time, several outbox relays with `FOR UPDATE SKIP LOCKED`.
 
 - [x] Synthetic tick generator at 10, 50, 100 ticks/s *(`./gradlew :loadtest:scale` measures; `replayer synth` drives the compose stack)*
 - [x] Gatling or k6 order traffic in parallel *(1,000 orders/s written to the log, not over HTTP: #92)*
