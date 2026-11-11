@@ -9,7 +9,7 @@ Fill in as you go. Every number names the commit and command that produced it.
 | Sustained ticks/s | | M6 |
 | Incremental speed-up | **27.4×** vs naive, **3.1×** vs full recompute (details below) | JMH / M3 |
 | Mismatches over 1M events | **0** (in-memory logs, and again through Redpanda; details below) | M4 harness |
-| Duplicate closes under chaos | | M5 |
+| Duplicate closes under chaos | **0** legs closed twice, 0 surplus legs, 0 unbalanced ledger transactions (details below) | M5 chaos gate |
 | Recovery hash match | | M6 |
 | Crash day: warned / called / squared off | | M7 report |
 
@@ -28,6 +28,42 @@ The average is the same as before the rolling rebuild (1,402 ± 12 µs), as expe
 Read this honestly: most of the 27× is "price each instrument once", which the full recompute also does. The delta update itself is the 3.1×. See decisions.md #44.
 
 At this rate one shard handles roughly 700 ticks per second for 10,000 accounts. M6 measures the real target (100k accounts, p99).
+
+## M5: square-off under full broker chaos
+
+`./gradlew :writers:test --tests '*SquareOffChaosTest' -Dchaos.accounts=2000 -Dchaos.ticks=80` on branch `m5-square-off`, JDK 25.0.2, Apple M4. Real Redpanda and Postgres (containers), real shards, writers, outbox relay and fill ingester; the mock broker at full chaos: 5% of requests time out (half lose the request, half lose the answer), 2% of orders rejected, fills late and split in up to three parts, 10% of fill callbacks delivered twice. Random book with a quarter of its cash, a falling market, users ordering throughout, and risk-ops squaring 8 accounts off by hand. The same test at 400 accounts runs on every build.
+
+| | 2,000 accounts, 80 ticks | 400 accounts, 40 ticks (every build) |
+| --- | ---: | ---: |
+| Square-off episodes (by hand) | 717 (8) | 122 (4) |
+| … resolved / exhausted | 717 / 0 | 122 / 0 |
+| Legs planned / filled / rejected and re-planned with seq + 1 | 1,695 / 1,662 / 33 | 281 / 273 / 8 |
+| Orders sent to the broker (legs + accepted user orders) | 4,419 keys, executed 4,419 times | 557 keys, executed 557 times |
+| Broker requests | 4,556 (137 requests lost, 102 answers lost) | 574 (17 lost, 12 answers lost) |
+| Relay timeouts → confirmed by `GET` (not resent) / not there (resent) | 102 / 137 | 12 / 17 |
+| Fills / duplicate callbacks / duplicates dropped by the shards | 7,253 / 726 / 726 | 939 / 91 / 91 |
+| Rows in `fills` / ledger transactions | 7,253 / 6,760 | 939 / 879 |
+| **Legs closed twice** (engine's outputs / Postgres fills per leg) | **0 / 0** | **0 / 0** |
+| **Surplus legs while one was in flight** | **0** | **0** |
+| **Ledger transactions not summing to zero** | **0** | **0** |
+| Accounts where the shards and the single-threaded reference engine disagree | 0 | 0 |
+| Wall time | 58 s | 13 s |
+
+The broker's own "same key twice executes once" never fired here: every time an answer was lost, the relay's query found the order, so no key was ever posted twice. That path is tested directly (`MockBrokerTest`: five posts of one key, one execution).
+
+The first version of this test found a real bug: dust left in an incrementally updated vector after a short was closed (about 1e-10 rupees) made four long-only accounts with negative cash look infinitely over their limit, so they were squared off and blocked while the reference engine left them alone. Fixed (decision 83), with a regression test.
+
+### The 1M-event stress run, with square-off in the engine
+
+`./gradlew :loadtest:stress`, as for M4, now also with risk-ops events and a broker thread answering every leg: 1,009,534 records, 945,499 outputs compared, 648 episodes, 8,671 legs, **0 mismatches** (outputs, final account state including the whole risk state, replay hash). Shards apply everything in 4.5 s; the reference takes 14.6 s.
+
+### Everything else
+
+`./gradlew build`: 137 tests, 0 failures, re-run from scratch. The Redpanda, Postgres, API and chaos tests run against real containers.
+
+### End to end through docker compose
+
+`./scripts/m4-e2e.sh`, now with the relay and the mock broker at full chaos. The order placed over HTTP goes ACCEPTED → SENT → FILLED, with its fill and ledger rows. The synthetic fall squared off 18 accounts (22 legs, all filled), with 0 legs closed twice and 30 ledger transactions all summing to zero. Risk-ops blocked and unblocked an account over HTTP (a replayed request was 409, a trader 403).
 
 ## M4: shards, orders, security
 
@@ -75,6 +111,10 @@ A small version (80,000 records) runs on every build, with a second test that hi
 | 429 | burst of 15 against a bucket of 10: first 10 pass, then refused with `Retry-After`; other users unaffected; bucket refills; requests with bad tokens use no one's bucket |
 | Replay | same `X-Request-Id` again → 409 with the original order id, also with a different body; exactly one order in the log; ids are per user |
 | Input validation | 21 malformed bodies → 400, including `\|` and line-break injection, strings and fractions for qty, unknown fields, attempts to set origin or order id; unknown account or instrument → 422; none reach the log |
+
+### Everything else
+
+`./gradlew build`: 137 tests, 0 failures, re-run from scratch. The Redpanda, Postgres, API and chaos tests run against real containers.
 
 ### End to end through docker compose
 

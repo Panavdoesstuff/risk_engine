@@ -1,7 +1,8 @@
 package riskengine.events;
 
 /**
- * Final outcome of one square-off leg, reported back by the broker side (used from M5).
+ * Not used. M5 reports a leg's outcome with the events every order uses: {@link Fill} when it executes and
+ * {@link OrderClosed} when the broker rejects it. Shards accept this event and ignore it, so old logs still read.
  *
  * @param legKey accountId:episodeId:instrumentId:seq
  */

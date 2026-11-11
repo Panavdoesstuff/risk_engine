@@ -1,4 +1,5 @@
-# One image for every JVM process in the project: shard host, Postgres writers, order API, replayer.
+# One image for every JVM process in the project: shard host, Postgres writers and outbox relay, order API,
+# mock broker, replayer.
 # docker-compose picks the process with `command`.
 #
 # Built inside the container, so a clean machine needs only Docker. Tests are not run here (CI runs them).
@@ -14,13 +15,15 @@ COPY writers writers
 COPY replayer replayer
 COPY api api
 COPY loadtest loadtest
-RUN ./gradlew --no-daemon :host:installDist :writers:installDist :replayer:installDist :api:bootJar -x test
+COPY broker-mock broker-mock
+RUN ./gradlew --no-daemon :host:installDist :writers:installDist :replayer:installDist :broker-mock:installDist :api:bootJar -x test
 
 FROM eclipse-temurin:21-jre
 RUN useradd --system --uid 10001 risk
 COPY --from=build /src/host/build/install/host /opt/host
 COPY --from=build /src/writers/build/install/writers /opt/writers
 COPY --from=build /src/replayer/build/install/replayer /opt/replayer
+COPY --from=build /src/broker-mock/build/install/broker-mock /opt/broker-mock
 COPY --from=build /src/api/build/libs/api-0.1.0-SNAPSHOT.jar /opt/api/api.jar
 USER risk
 WORKDIR /opt

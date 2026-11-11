@@ -45,7 +45,7 @@ risk-engine/
 │   └── events/                 # event records + deterministic serialisation
 ├── api/                        # Spring Boot order API (JWT, rate limit, validation)
 ├── writers/                    # engine-out → Postgres batch writers, outbox relay
-├── broker-mock/                # chaos broker: timeouts, rejects, delays, dup fills
+├── broker-mock/                # chaos broker: timeouts, rejects, delays, dup fills (the relay and fill ingester live in writers/)
 ├── replayer/                   # historical minute replay + synthetic tick generator
 ├── loadtest/                   # Gatling/k6 scripts, JMH benchmarks
 ├── report/                     # crash-day report generator
@@ -126,18 +126,20 @@ Start `docs/decisions.md` on day one. Write one short entry every time you choos
 
 ### M5 — Square-off pipeline
 
-- [ ] Status state machine using **expected** utilisation (subtract in-flight legs' expected release)
-- [ ] `InFlightTracker`: record leg before emitting; key `accountId:episodeId:instrumentId:seq`
-- [ ] Greedy `LegPlanner`: most margin released per lot, short options first, re-plan after each leg
-- [ ] Writer inserts order + outbox row in one transaction; relay sends unsent outbox rows
-- [ ] Mock broker chaos: 5% timeouts, 2% rejects, delayed fills, 10% duplicate callbacks; idempotent on key
-- [ ] Timeout handling: query broker by key before retrying
-- [ ] Reject handling: drop from in-flight, next tick re-plans with `seq + 1`
-- [ ] Fills: broker callback → `engine-events` (account's partition); shard dedupes with `seenFillIds`; Postgres unique `broker_fill_id`
-- [ ] Double-entry ledger for every fill and margin movement
-- [ ] Audit log row for every square-off decision
+> **Done** (decisions.md #72–#86). Also: risk-ops block / unblock / manual square-off (`AccountControl` events), and the fill ingester refuses callbacks that don't match an order we placed. The tracker lives inside `AccountRisk`, the state machine shared by both engines, rather than as a separate class.
 
-**Gate:** under full chaos, 0 legs closed twice, 0 surplus legs while one is in flight, every ledger `txn_id` sums to zero.
+- [x] Status state machine using **expected** utilisation (subtract in-flight legs' expected release) *(fills may lower a level, never raise it)*
+- [x] `InFlightTracker`: record leg before emitting; key `accountId:episodeId:instrumentId:seq` *(one leg in flight per account at a time)*
+- [x] Greedy `LegPlanner`: most margin released per lot, short options first, re-plan after each leg
+- [x] Writer inserts order + outbox row in one transaction; relay sends unsent outbox rows
+- [x] Mock broker chaos: 5% timeouts, 2% rejects, delayed fills, 10% duplicate callbacks; idempotent on key
+- [x] Timeout handling: query broker by key before retrying
+- [x] Reject handling: drop from in-flight, next tick re-plans with `seq + 1` *(re-plans at once, on the reject)*
+- [x] Fills: broker callback → `engine-events` (account's partition); shard dedupes with `seenFillIds`; Postgres unique `broker_fill_id`
+- [x] Double-entry ledger for every fill and margin movement *(every fill that moves cash; margin movements are not cash in this model, see #82)*
+- [x] Audit log row for every square-off decision
+
+**Gate:** under full chaos, 0 legs closed twice, 0 surplus legs while one is in flight, every ledger `txn_id` sums to zero. **Passed.**
 
 > **MVP line.** Resume-ready from here. Update README with what works and the numbers so far.
 

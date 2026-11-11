@@ -1,6 +1,6 @@
 # Architecture
 
-*Filled in as milestones land. Current state: M4 (shards on Redpanda, order API, security, Postgres writers). The broker and square-off are M5.*
+*Filled in as milestones land. Current state: M5 (square-off pipeline). Snapshots, recovery and the scale numbers are M6.*
 
 ```
 replayer ──ticks (every partition, global tick_seq)──▶ engine-events[0..N-1] ──▶ ShardRunner × N
@@ -134,3 +134,33 @@ Orders are rejected with `NO_MARKET` until at least one tick is in the log.
 ```
 
 Compared: every output in order, every account's final state, and each live shard's hash against a single-threaded replay. `./gradlew :loadtest:stress` (add `--args="--redpanda host:port"` to run it through a broker).
+
+## Square-off (M5)
+
+```
+                         engine-events[p] (the account's partition)
+  ticks ──────────────────────┐  ▲  ▲  ▲
+  API: orders, AccountControl ─┘  │  │  └──────────── fill ingester ◀── broker callbacks (FILL, REJECT)
+                                  │  └─ relay: OrderClosed(REJECTED) if the broker refuses an order   ▲
+                                  ▼                                                                 │
+                       ShardRunner p ── AccountRisk per account                                      │
+                         level on expected utilisation; episode; ONE leg in flight                  │
+                                  │                                                                 │
+                                  ▼  LEG / EPISODE / STATUS / POSITION / DECISION / RELEASED          │
+                              engine-out[p] ──▶ writers ──▶ Postgres: orders + outbox (one txn),    │
+                                                            legs, episodes, fills, ledger, audit    │
+                                                                      │                             │
+                                                                      ▼                             │
+                                                       relay: unsent outbox rows ──POST /orders──▶ mock broker
+                                                       timeout? GET /orders/{key} before resending
+```
+
+**An episode, step by step.**
+
+1. A tick takes the account's expected utilisation to 120% or more for the third tick running. `AccountRisk` opens episode E*n*, cancels the account's open user orders, and refuses new ones.
+2. `LegPlanner` picks the leg: the short option (else future, else long option) whose closing frees the most margin per lot; in AUTO the fewest lots that bring utilisation under 100%. The leg is recorded as in flight, then emitted as `LEG|v1|A:E1:INSTR:1|…`.
+3. The writers insert `orders` (origin SQUARE_OFF, id = the key) and `outbox` in one transaction. The relay posts it to the broker. On a timeout it asks `GET /orders/{key}` before sending again; the broker executes a key once however often it is posted.
+4. The broker's fills come back in parts, sometimes twice. The ingester checks each matches an order we placed, for that account and instrument, and writes it to the account's partition. The shard drops fill ids it has seen.
+5. When the leg's fills add up to the leg, the shard looks again: back under 100% → RESOLVED; otherwise the next leg (seq 2). A broker reject (`OrderClosed`) drops the leg and plans again with seq + 1. Nothing useful left to close → EXHAUSTED, and the account is blocked for risk-ops.
+
+**Status, as written to `accounts.status`:** BLOCKED (risk-ops, or an exhausted square-off) › SQUARING_OFF (episode open) › MARGIN_CALL (level ≥ MARGIN_CALL) › ACTIVE.

@@ -12,7 +12,7 @@ public record Caller(String userId, Role role, String accountId) {
     public enum Role {
         /** May place orders on, and read orders of, their own account only. */
         TRADER("trader"),
-        /** May read any account's orders. Places no user orders. (Block/unblock and manual square-off: M5.) */
+        /** May read any account and its orders, block and unblock an account, and square one off. Places no user orders. */
         RISK_OPS("risk-ops");
 
         private final String claim;

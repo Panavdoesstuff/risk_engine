@@ -24,6 +24,9 @@ import riskengine.margin.EngineOutput;
 import riskengine.margin.OrderClosure;
 import riskengine.margin.OrderDecision;
 import riskengine.margin.PositionChange;
+import riskengine.margin.AccountStatusChange;
+import riskengine.margin.EpisodeChange;
+import riskengine.margin.SquareOffLeg;
 import riskengine.margin.MarginEvent;
 import riskengine.margin.MarginResult;
 import riskengine.margin.Position;
@@ -88,10 +91,21 @@ class ShardStateTest {
                 assertEquals(f.qty(), s.qty(), who);
                 assertEquals(0, f.avgPrice().compareTo(s.avgPrice()), who + " average price");
                 assertEquals(0, f.cash().compareTo(s.cash()), who + " cash");
+                assertEquals(0, f.cashDelta().compareTo(s.cashDelta()), who + " cash delta");
+                assertEquals(f.orderRemaining(), s.orderRemaining(), who + " order remaining");
                 continue;
             }
-            if (full.get(i) instanceof OrderClosure f) {
-                assertEquals(f, incremental.get(i));
+            if (full.get(i) instanceof SquareOffLeg f) {
+                SquareOffLeg s = (SquareOffLeg) incremental.get(i);
+                assertEquals(f.legKey(), s.legKey());
+                assertEquals(f.qty(), s.qty(), f.legKey());
+                assertEquals(0, f.mark().compareTo(s.mark()), f.legKey() + " mark");
+                assertClose(f.expectedRelease(), s.expectedRelease(), f.legKey() + " expected release");
+                continue;
+            }
+            if (!(full.get(i) instanceof MarginEvent)) {
+                // Closures, episode changes and status changes carry no computed money: they must be equal.
+                assertEquals(full.get(i), incremental.get(i));
                 continue;
             }
             MarginEvent f = (MarginEvent) full.get(i), s = (MarginEvent) incremental.get(i);
@@ -152,7 +166,7 @@ class ShardStateTest {
             String id = b.id();
             assertEquals(reference.positions(id), shard.positions(id), id + " positions");
             assertEquals(0, reference.cash(id).compareTo(shard.cash(id)), id + " cash");
-            assertEquals(reference.level(id), shard.level(id), id + " level");
+            assertEquals(reference.riskFingerprint(id), shard.riskFingerprint(id), id + " level, status, episode, leg in flight");
             assertEquals(reference.pendingOrders(id), shard.pendingOrders(id), id + " reserved orders");
             assertSameResult(reference.latest(id), shard.latest(id), id);
         }
@@ -170,6 +184,9 @@ class ShardStateTest {
                 case OrderDecision d -> 1;
                 case PositionChange p -> 2;
                 case OrderClosure c -> 3;
+                case SquareOffLeg l -> 4;
+                case EpisodeChange e -> 5;
+                case AccountStatusChange s -> 6;
             })
             .thenComparing(o -> o instanceof MarginEvent m ? m.tickSeq() : 0L)
             .thenComparing(EngineOutput::accountId)
@@ -178,6 +195,9 @@ class ShardStateTest {
                 case OrderDecision d -> d.orderId();
                 case PositionChange p -> p.fillId();
                 case OrderClosure c -> c.orderId();
+                case SquareOffLeg l -> l.legKey();
+                case EpisodeChange e -> e.episodeId() + e.state();
+                case AccountStatusChange s -> s.tickSeq() + s.cause() + s.to();
             });
 
     static String replay(List<AccountBook> books, List<Event> events, ShardConfig cfg) {

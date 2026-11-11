@@ -124,7 +124,7 @@ M2 only looked forward: a long future that had already fallen 2,000 points showe
 **33. One piece of bookkeeping code for fills, shared by the reference engine and the shards.**
 Options: premium moves in cash at once. Futures: no cash when opening; closing realises the profit or loss on the closed part into cash. Average price: weighted average when adding, unchanged when reducing, restarts at the fill price when a position flips through zero. Averages keep 6 decimals with a fixed rounding rule. Because both engines call the same code, a mismatch between them can only be a margin-maths bug, never a bookkeeping one.
 
-**34. Only ticks feed the level tracker.**
+**34. Only ticks feed the level tracker.** *(Changed in M5, decision 73: a fill may now lower a level, never raise it.)*
 "Three consecutive ticks over 100%" should mean three market readings. A fill updates positions, cash and the account's latest margin figure immediately, but it is not a reading and can't escalate or clear a level. *Agreed for M5:* a fill will be allowed to lower an account's level (a square-off leg that brings it back under a threshold should show at once) but never to raise it.
 
 **35. Four event types, one text line each. Orders and square-off results are accepted and ignored for now.**
@@ -153,7 +153,7 @@ It covers the next offset, last tick, markets, risk arrays, and per account: cas
 **41. Shards refuse out-of-order input rather than trying to fix it.**
 An offset gap, a tick whose `tick_seq` doesn't increase, or a fill for an account the shard doesn't own is an error that stops the shard. Guessing would produce a state nobody can reproduce.
 
-**42. Which scenario is reported as "worst" can differ between engines when two scenarios tie.**
+**42. Which scenario is reported as "worst" can differ between engines when two scenarios tie.** *(M5 adds a related case, decision 83.)*
 For a futures-only account, scenarios that differ only in volatility lose exactly the same amount, so rounding dust decides which number is reported. The loss itself agrees. Within one shard the label is still deterministic.
 
 **43. Ticks are built from minute bars using only what was known at the time, and written once by one writer.**
@@ -254,8 +254,8 @@ One loop: poll up to 2,000 records → one database transaction → commit it �
 
 **65. Order status is read from Postgres; the Redis status store is gone.** *(Replaces #60.)*
 The API inserts the order as PENDING just before writing it to the log (`ON CONFLICT DO NOTHING`); the writers set ACCEPTED / REJECTED, and later CANCELLED / BROKER_REJECTED on a close. `last_event_seq = -1` marks a row the engine has not decided yet, so a decision can never be overwritten by PENDING. Redis now holds only rate-limit buckets and request ids.
-- *Side effect, a change from part 1:* the `orders` table has foreign keys to accounts and instruments, so an order naming something that doesn't exist can't be inserted. The API answers **422** and writes nothing to the log (the request id is given back). In part 1 such orders got 202 and a shard rejection. The shard still rejects them if they reach it some other way.
-- `GET /orders/{id}` returns the order row. The margin numbers behind a decision are in `audit_log.details`.
+- *Approved after M4.* *Side effect, a change from part 1:* the `orders` table has foreign keys to accounts and instruments, so an order naming something that doesn't exist can't be inserted. The API answers **422** and writes nothing to the log (the request id is given back). In part 1 such orders got 202 and a shard rejection. The shard still rejects them if they reach it some other way.
+- `GET /orders/{id}` returns the order row, including the required and available margin the pre-trade check computed *(added back in M5 at your request; V4 stores them on the order)*.
 - *Cost:* the API now needs Postgres to accept an order, where before it needed only Redis and Redpanda. If Postgres is down the API answers 503.
 
 **66. The stress harness races real threads, then lets the log say what happened.**
@@ -273,13 +273,86 @@ The first 1M run took 60 seconds, because each pre-trade check walked every open
 **68. Per-shard lag = partition end offset − the shard's applied offset.**
 It is the number that says whether a shard is keeping up. A background thread asks the broker for the end offsets twice a second with its own consumer, so measuring never gets in a shard's way. The shard host serves the numbers as Prometheus text at `:9100/metrics` (`risk_shard_lag_events`, `risk_shard_applied_offset`, `risk_shard_log_end_offset`, `risk_shard_up`) and `/healthz` turns 503 once a shard has stopped. It uses the JDK's built-in HTTP server; M6 points Prometheus at it. The two offsets are read a moment apart, so it is a gauge, not an exact count.
 
-**69. docker compose: the engine is behind the `app` profile, in one image.**
+**69. docker compose: the engine is behind the `app` profile, in one image.** *(Approved after M4.)*
 `docker compose up -d` still starts only the infrastructure, because that has to work on a machine with no data yet (the M1 gate). `docker compose --profile app up -d` adds a one-shot book loader, the shard host, the writers and the API, all from one image built by the Dockerfile (Gradle runs inside the build, so only Docker is needed). They read the book from `./data`.
 - Host ports are variables, so a second copy can run beside the first. `scripts/m4-e2e.sh` uses that: it runs as its own compose project on its own ports and volumes and deletes them afterwards, never touching the default stack.
-- The compose file gives the API a fixed development JWT secret if `JWT_SECRET` is not set. That is fine on a laptop and nowhere else; the API itself still has no default.
+- The compose file gives the API a fixed development JWT secret if `JWT_SECRET` is not set. That is fine on a laptop and nowhere else; the API itself still has no default. *(Approved after M4; the README now says so.)*
 
 **70. The replayer writes ticks to Redpanda, once.**
 `replayer ticks --redpanda host:port` writes every tick to every partition of `engine-events`. It first reads the partitions and refuses if any already holds a tick: a second copy would break "tick_seq strictly increases" and stop every shard. `--pace-ms` slows it down for watching.
 
 **71. `replayer demo` writes synthetic inputs, clearly marked.**
 The real 3–4 June files aren't in the repo yet, and the end-to-end run needs a book and ticks. `replayer demo` writes an instruments file priced by the engine's own Black-Scholes and raw minute bars with a made-up fall of about 8%, then the normal `bars`, `seed` and `ticks` commands run on them. Every file says SYNTHETIC. Nothing produced from it may be quoted as a result about 4 June 2024.
+
+## M5: the square-off pipeline
+
+**72. The fill ingester is the gate in front of the shards; shards keep stopping on bad input.** *(Your call after M4.)*
+Broker callbacks arrive over HTTP at the ingester (in the `writers` module), the only thing that writes fills to the log. A callback is refused with 422, recorded in `audit_log` as `CALLBACK_REFUSED`, and never written, unless it is exactly the expected shape (well-formed ids, non-zero quantity, non-negative price) and its key is an order we placed *for that account and that instrument*. The order row's foreign keys prove both exist, and the match stops a fill being booked to the wrong account. So a shard never sees a fill it can't apply, and decision 41 stays as it was. Duplicates are let through on purpose: whether a fill id is new is decided by the shard, in log order. If Postgres or the log is down the answer is 503 and the broker calls again.
+
+**73. One state machine, `AccountRisk`, shared by the shard and the reference engine.**
+Level, status and square-off episode are decided in one class. The two engines differ only in how they answer "what would the margin be if…" (`AccountView`): the shard adjusts a copy of its vectors, the reference rebuilds from positions. That is the same split as decision 33 for bookkeeping: a disagreement between them can only be margin maths.
+- *Level* (OK / WARNING / MARGIN_CALL / SQUARE_OFF) is fed **expected** utilisation once per tick: the account as it will be once the leg in flight has filled. Feeding actual utilisation would keep asking for more while a leg is on its way.
+- *A fill may lower the level at once, never raise it* (your rule after M3). Raising still takes three consecutive ticks. Lowering also resets the streaks, so a fill that cures an account cancels a square-off that was one tick away.
+- *Status* (accounts.status): BLOCKED over SQUARING_OFF over MARGIN_CALL over ACTIVE. Each change is an output with a cause (`SQUARE_OFF_STARTED`, `BLOCKED_BY_RISK_OPS`, `SQUARE_OFF_EXHAUSTED`, …) and an actor.
+
+**74. A square-off episode: opened by the level, closed by the account's state, one leg at a time.**
+- *Opens* when the level reaches SQUARE_OFF (AUTO) or when risk-ops asks (MANUAL). Episode ids count per account (E1, E2, …), so leg keys from two episodes can never collide.
+- *While open:* the level is frozen (square-off is sticky, as the build map asked in M2); user orders are refused with `SQUARING_OFF`; the account's reservations are cancelled, each with its own `RELEASED` output.
+- *Ends* RESOLVED when utilisation is back under 100% (AUTO) or the account is flat (MANUAL), and EXHAUSTED when it is still over and nothing left would free margin when closed. The check runs after every fill, so an episode ends on the fill that cures it, not on the next tick.
+- *An exhausted account is blocked* until risk-ops unblocks it (or its positions change). Otherwise it would open a new, useless episode every three ticks. *Needs a decision, see the report.*
+
+**75. The in-flight tracker: at most one leg, recorded before it is emitted.**
+`AccountRisk` holds the leg in flight (key, instrument, signed remaining quantity) and sets it in the same step that emits the `LEG` output, so the state hash never shows a leg that was sent but not recorded. No new leg is planned while one is out. Fills with the leg's key reduce what remains; the episode moves on when it reaches zero. A fill for a leg that is no longer in flight (it was rejected, then filled after all) changes the position, because the trade happened, but does not count as progress. *This is what makes "0 surplus legs while one is in flight" true by construction; the gate checks it from the outside anyway.*
+*Deviation from the map:* the map says one in-flight record per leg, which suggests several legs out at once. One at a time is slower to close a big account but can never overshoot. M6's latency numbers will show whether that matters.
+
+**76. Leg key = `accountId:episodeId:instrumentId:seq`. It is the order id, the outbox idempotency key and what the broker dedupes on.**
+`seq` counts legs within the episode, so a re-planned leg after a reject gets `seq + 1`: a new key, which the broker treats as a new order. However many times a leg is published (replays), stored (ON CONFLICT DO NOTHING) or sent (timeouts), it executes once.
+
+**77. The greedy planner: short options first, then futures, then long options; within a class, most margin freed per lot.**
+Short options carry the open-ended risk and the short-option minimum, so they go first even when closing a future would free more. In AUTO it closes the fewest whole lots that bring utilisation under 100%, or the whole position if that is not enough; in MANUAL, whole positions until flat. A position whose first lot frees under a paisa (a long option needs no margin) is never a candidate in AUTO, so a margin call never sells someone's hedge for nothing. Ties go to the lower instrument id.
+*Deviation:* the map says "next tick re-plans with seq + 1" after a reject. It re-plans at once, on the `OrderClosed`, at the latest tick's prices. Same rule, one tick sooner.
+
+**78. Order and outbox row in one transaction, and accepted user orders go to the broker too.**
+The writers insert a leg's `orders` row (origin SQUARE_OFF, id = the leg key) and its outbox row in the same database transaction as the rest of the batch. Accepted user orders get an outbox row the same way, so user fills now come from the broker as well and release reservations normally. Replaying `engine-out` creates no second outbox row (unique key), so nothing is sent twice because of a restart.
+
+**79. The relay: send in order; on a timeout, ask before sending again.**
+One relay thread sends unsent outbox rows oldest first and marks them sent on an acknowledgement.
+- *Timeout or connection error:* the order may or may not have arrived. The relay asks the broker (`GET /orders/{key}`). If it is there, the row is marked sent. If not, the row stays unsent and the next round sends it again with the same key.
+- *Broker refuses the order as malformed (4xx):* the relay writes `OrderClosed(REJECTED)` to the log so the engine releases the order or re-plans the leg.
+- *Limitation:* one relay at a time. Two would need row locking (`FOR UPDATE SKIP LOCKED`), which isn't there.
+
+**80. The mock broker misbehaves on purpose, and is idempotent on the key.**
+- 5% of requests time out. Half lose the request (the order is never created) and half lose only the answer (the order exists). That way the relay's "ask before resending" is exercised both ways.
+- 2% of orders are rejected by callback after being acknowledged.
+- Fills are split into one to three parts, each after a random delay.
+- 10% of fill callbacks are delivered twice.
+- What happens to an order is drawn from its key (the same key always meets the same fate); whether a request times out is drawn per request.
+- The first POST for a key executes it; every later POST for that key is answered and executes nothing.
+- *GUESS:* the rates are the build map's numbers, not measured from any real broker.
+
+**81. What the writers store for M5.** Migration V4.
+- `accounts.status`, guarded by its own `status_event_seq`, because one event can change both status and cash.
+- `square_off_episodes` (with mode and actor), `square_off_legs` (PLANNED → SENT → FILLED / REJECTED).
+- `fills`, one row per broker fill id, only for orders Postgres knows.
+- `orders` gets the decision's required and available margin.
+- `margin_events` is now unique on (account, source offset) instead of (account, tick_seq), because a level can also change on a fill: two changes can share a tick.
+- One audit row per decision: level changes, order decisions, closes, every planned leg, episode opened/resolved/exhausted, every status change. Risk-ops actions carry the user as the actor.
+
+**82. The double-entry ledger books every fill that moves cash: two rows that sum to zero.**
+An option fill moves premium between the account's CASH and BROKER_CLEARING; a futures fill that closes a position moves the realised profit or loss between CASH and REALISED_PNL. The transaction id is `FILL:<broker fill id>`, so a duplicate fill can't be booked twice, and both rows go in one statement guarded by "this transaction is not booked yet", so a transaction is never half there. Postgres' deferred trigger rejects any transaction that does not sum to zero at commit. That is the gate's third check.
+*Not booked:* "margin movements". The engine never moves money when the requirement changes: required margin is a computed number, not cash set aside. There is nothing to book until we decide to model blocking margin as a transfer (CASH → MARGIN_BLOCKED). *Needs a decision, see the report.* Fills that open or add to a futures position move no cash and book nothing.
+
+**83. A requirement under a millionth of a rupee is zero.** *(Found by the chaos gate.)*
+The shard updates vectors incrementally. After a short option is bought back, its share of the totals can be left at 1e-10 instead of 0 until the next rolling rebuild. An account holding only long options with negative cash then read as "something required, nothing available" = infinite utilisation, and was squared off and blocked, while the reference engine, which rebuilds from positions, saw zero. Four accounts in the first chaos run did this. `MarginCalculator` now treats a requirement below ₹0.000001 as zero, and a regression test reproduces the case. Decision 38's drift check didn't catch it, because the drift was far below a paisa; what made it matter was a threshold sitting exactly at zero.
+
+**84. Risk-ops: block, unblock and manual square-off go through the log like everything else.**
+`POST /accounts/{id}/block`, `/unblock` and `/square-off` (risk-ops only; 403 for traders) write an `AccountControl` event to the account's partition and answer 202, exactly like an order. The shard applies it in line with the account's ticks, fills and orders, so "blocked" takes effect at a definite point in the log, and replays reproduce it. Each needs an `X-Request-Id`, and a repeat is 409, so a retried square-off can't fire twice. `GET /accounts/{id}` shows status and cash (traders: their own account only, otherwise 404). Unblocking also lifts a block the engine set after an exhausted episode. A manual square-off on an account already being squared off switches that episode to MANUAL (close everything).
+
+**85. The stress harness now includes square-off and risk-ops.**
+The 1M-event run adds `AccountControl` events (1% of account events) and a small broker thread that answers every leg with a fill for the whole leg (4% rejected instead, 10% delivered twice). Episodes, legs, in-flight state and status are part of what is compared and hashed. Hot accounts are hammered so hard that they spend most of the run being squared off, which shows up as many `SQUARING_OFF` rejections: that is the intended stress, not a business result.
+
+**86. On the M4 CI failure (job `m4-e2e`, "FAIL compose up").**
+The script ran `docker compose up -d >/dev/null 2>&1 || fail "compose up"`, so it threw away the one message that said what failed. Running main's compose stack on a clean Linux Docker engine (Docker 28, the same steps as the job) succeeded, so I can't name the cause from here. Changes:
+- The script now saves compose's output and, on any failure, prints it with the state of every container and the last 60 lines of every service's log.
+- Redpanda's health check may now take up to three minutes instead of one. A dependency that never turns healthy is what makes `up` fail, and a cold CI runner starting the broker is the likeliest one.
+If CI fails again, the log will say why.

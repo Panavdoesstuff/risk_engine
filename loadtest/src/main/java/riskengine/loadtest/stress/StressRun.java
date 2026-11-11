@@ -10,6 +10,7 @@ import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.UnaryOperator;
+import riskengine.events.AccountControl;
 import riskengine.events.AccountEvent;
 import riskengine.events.Event;
 import riskengine.events.EventLog;
@@ -29,6 +30,8 @@ import riskengine.margin.MarginResult;
 import riskengine.margin.OrderClosure;
 import riskengine.margin.OrderDecision;
 import riskengine.margin.PositionChange;
+import riskengine.margin.SquareOffLeg;
+import riskengine.margin.EpisodeChange;
 import riskengine.margin.ReferenceMarginEngine;
 import riskengine.ref.Instrument;
 import riskengine.ref.InstrumentType;
@@ -53,8 +56,10 @@ import riskengine.shard.ShardState;
  * it, is preserved.) Then it compares:
  * <ol>
  *   <li>every output of every shard, one by one and in order, with the reference's: level changes, order
- *       decisions and their reasons, position changes, reservation releases;</li>
- *   <li>every account's final positions, cash, level, reservations and margin;</li>
+ *       decisions and their reasons, position changes, reservation releases, square-off legs, episode and
+ *       account-status changes;</li>
+ *   <li>every account's final positions, cash, reservations, margin, and its whole risk state (level,
+ *       status, episode, leg in flight);</li>
  *   <li>each live shard's state hash with the hash from replaying its recorded partition on one thread.</li>
  * </ol>
  * Money is compared to a millionth of a rupee, because the shard updates incrementally and the reference
@@ -105,6 +110,7 @@ public final class StressRun {
         }
         RedpandaLogs broker = redpanda;
         AtomicLongArray appended = new AtomicLongArray(n);
+        java.util.concurrent.ConcurrentLinkedQueue<SquareOffLeg> legsToFill = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
         List<List<AccountBook>> owned = new ArrayList<>();
         for (int p = 0; p < n; p++) owned.add(new ArrayList<>());
@@ -116,7 +122,10 @@ public final class StressRun {
             states[p] = new ShardState(p, margin, ShardConfig.defaults(), instruments, owned.get(p));
             List<EngineOutput> sink = new ArrayList<>(); // written only by that shard's thread
             shardOut.add(sink);
-            runners[p] = new ShardRunner(states[p], logs[p], (EngineOutput o) -> sink.add(o));
+            runners[p] = new ShardRunner(states[p], logs[p], (EngineOutput o) -> {
+                sink.add(o);
+                if (o instanceof SquareOffLeg leg) legsToFill.add(leg); // handed to the harness's little broker
+            });
         }
 
         // ------------------------------------------------------------ the race
@@ -210,8 +219,13 @@ public final class StressRun {
                         e = o == null || r.nextBoolean() ? lastFill
                                 : new OrderRequest(o.orderId(), o.accountId(), o.instrument().id(), o.signedQty() > 0 ? OrderRequest.Side.BUY : OrderRequest.Side.SELL,
                                         Math.abs(o.signedQty()), OrderRequest.Origin.USER, time);
-                    } else {
+                    } else if (kind < 99) {
                         e = new SquareOffResult(account + ":E1:" + instrument.id() + ":0", account, instrument.id(), SquareOffResult.Status.REJECTED, time);
+                    } else {
+                        // Risk-ops, now and then: block, unblock (most often, so accounts do not stay blocked), or square off by hand.
+                        int what = r.nextInt(8);
+                        e = new AccountControl(account, what == 0 ? AccountControl.Action.BLOCK : what == 1 ? AccountControl.Action.SQUARE_OFF : AccountControl.Action.UNBLOCK,
+                                "risk-ops:stress", "C-" + id + "-" + seq, time);
                     }
                     int p = Partitioner.partition(e.accountId(), n);
                     if (broker != null) broker.appendAsync(p, (Event) e);
@@ -221,6 +235,29 @@ public final class StressRun {
                 }
             }, "writer-" + w));
         }
+
+        // A minimal broker: every leg a shard plans comes back as a fill for the whole leg (now and then
+        // twice, and now and then as a reject instead), written into the same partitions the writers are
+        // racing on. Without it every square-off would hang on its first leg.
+        Thread legFiller = new Thread(() -> {
+            SplittableRandom r = new SplittableRandom(cfg.seed() ^ 0xB0CEL);
+            while (writing[0] || !legsToFill.isEmpty()) {
+                SquareOffLeg leg = legsToFill.poll();
+                if (leg == null) {
+                    Thread.onSpinWait();
+                    continue;
+                }
+                int p = Partitioner.partition(leg.accountId(), n);
+                int roll = r.nextInt(100);
+                Event e = roll < 4 ? new OrderClosed(leg.legKey(), leg.accountId(), OrderClosed.Reason.REJECTED, leg.logTimeMillis())
+                        : new Fill("LF-" + leg.legKey(), leg.legKey(), leg.accountId(), leg.instrumentId(), leg.qty(), leg.mark(), leg.logTimeMillis());
+                for (int copies = roll >= 90 ? 2 : 1; copies > 0; copies--) {
+                    if (broker != null) broker.appendAsync(p, e);
+                    else logs[p].append(e);
+                    appended.incrementAndGet(p);
+                }
+            }
+        }, "leg-filler");
 
         Thread lagSampler = new Thread(() -> {
             while (writing[0]) {
@@ -237,16 +274,23 @@ public final class StressRun {
         tickWriter.start();
         writers.forEach(Thread::start);
         lagSampler.start();
+        legFiller.start();
         for (Thread t : writers) t.join();
         tickWriter.join();
-        if (broker != null) broker.flush();
-        writing[0] = false;
-        for (int p = 0; p < n; p++) {
-            while (runners[p].appliedOffset() < appended.get(p)) {
+        // Legs chain: a fill makes the shard plan the next leg, which the filler fills, and so on. Wait until
+        // every shard has applied everything and no leg is waiting, several times in a row.
+        for (int quiet = 0; quiet < 5; ) {
+            if (broker != null) broker.flush();
+            boolean still = legsToFill.isEmpty();
+            for (int p = 0; p < n; p++) {
                 if (runners[p].failure() != null) throw new IllegalStateException("shard " + p + " stopped", runners[p].failure());
-                Thread.sleep(2);
+                still &= runners[p].appliedOffset() >= appended.get(p);
             }
+            quiet = still ? quiet + 1 : 0;
+            Thread.sleep(still ? 20 : 2);
         }
+        writing[0] = false;
+        legFiller.join();
         double liveSeconds = (System.nanoTime() - start) / 1e9;
         for (ShardRunner r : runners) r.stop();
         for (Thread t : shardThreads) t.join();
@@ -296,7 +340,7 @@ public final class StressRun {
 
         // ------------------------------------------------------------ compare
         List<String> examples = new ArrayList<>();
-        long outputMismatches = 0, outputs = 0, levelChanges = 0, releases = 0;
+        long outputMismatches = 0, outputs = 0, levelChanges = 0, releases = 0, legs = 0, episodes = 0;
         SortedMap<String, Long> decisions = new TreeMap<>();
         for (int p = 0; p < n; p++) {
             List<EngineOutput> expected = refOut.get(p), actual = shardOut.get(p);
@@ -318,7 +362,9 @@ public final class StressRun {
                     case OrderDecision d -> decisions.merge(d.reason().name(), 1L, Long::sum);
                     case MarginEvent m -> levelChanges++;
                     case OrderClosure c -> releases += c.released() != 0 ? 1 : 0;
-                    case PositionChange pc -> { }
+                    case SquareOffLeg l -> legs++;
+                    case EpisodeChange e -> episodes += e.state() == EpisodeChange.State.OPENED ? 1 : 0;
+                    default -> { }
                 }
             }
         }
@@ -328,7 +374,7 @@ public final class StressRun {
             String id = b.id();
             String diff = !reference.positions(id).equals(s.positions(id)) ? "positions " + reference.positions(id) + " vs " + s.positions(id)
                     : reference.cash(id).compareTo(s.cash(id)) != 0 ? "cash " + reference.cash(id) + " vs " + s.cash(id)
-                    : reference.level(id) != s.level(id) ? "level " + reference.level(id) + " vs " + s.level(id)
+                    : !reference.riskFingerprint(id).equals(s.riskFingerprint(id)) ? "risk state " + reference.riskFingerprint(id) + " vs " + s.riskFingerprint(id)
                     : !reference.pendingOrders(id).equals(s.pendingOrders(id)) ? "reservations differ"
                     : difference(reference.latest(id), s.latest(id));
             if (diff != null) {
@@ -348,7 +394,7 @@ public final class StressRun {
             duplicateFills += states[p].duplicateFills();
             duplicateOrders += states[p].duplicateOrders();
         }
-        return new StressReport(records, byType, outputs, decisions, levelChanges, releases, duplicateFills, duplicateOrders,
+        return new StressReport(records, byType, outputs, decisions, levelChanges, releases, episodes, legs, duplicateFills, duplicateOrders,
                 outputMismatches, stateMismatches, replayMismatches, maxLag.get(), liveSeconds, referenceSeconds, examples);
     }
 
@@ -380,20 +426,28 @@ public final class StressRun {
             case MarginEvent e -> {
                 MarginEvent a = (MarginEvent) actual;
                 yield e.accountId().equals(a.accountId()) && e.tickSeq() == a.tickSeq() && e.from() == a.from() && e.to() == a.to()
-                        && difference(e.result(), a.result()) == null;
+                        && difference(e.result(), a.result()) == null && close(e.expectedUtilisation(), a.expectedUtilisation());
             }
             case OrderDecision e -> {
                 OrderDecision a = (OrderDecision) actual;
                 yield e.orderId().equals(a.orderId()) && e.accountId().equals(a.accountId()) && e.accepted() == a.accepted() && e.reason() == a.reason()
                         && e.lastTickSeq() == a.lastTickSeq() && close(e.requiredAfter(), a.requiredAfter()) && close(e.availableAfter(), a.availableAfter())
-                        && close(e.utilisationAfter(), a.utilisationAfter());
+                        && close(e.utilisationAfter(), a.utilisationAfter()) && e.mark().compareTo(a.mark()) == 0;
             }
             case PositionChange e -> {
                 PositionChange a = (PositionChange) actual;
                 yield e.fillId().equals(a.fillId()) && e.accountId().equals(a.accountId()) && e.instrumentId().equals(a.instrumentId())
-                        && e.qty() == a.qty() && e.avgPrice().compareTo(a.avgPrice()) == 0 && e.cash().compareTo(a.cash()) == 0;
+                        && e.qty() == a.qty() && e.avgPrice().compareTo(a.avgPrice()) == 0 && e.cash().compareTo(a.cash()) == 0
+                        && e.orderId().equals(a.orderId()) && e.fillQty() == a.fillQty() && e.cashDelta().compareTo(a.cashDelta()) == 0
+                        && e.orderRemaining() == a.orderRemaining();
             }
-            case OrderClosure e -> e.equals(actual);
+            case SquareOffLeg e -> {
+                SquareOffLeg a = (SquareOffLeg) actual;
+                yield e.legKey().equals(a.legKey()) && e.qty() == a.qty() && e.mark().compareTo(a.mark()) == 0 && e.tickSeq() == a.tickSeq()
+                        && close(e.expectedRelease(), a.expectedRelease());
+            }
+            // Closures, episode changes and status changes carry no computed money: they must be equal.
+            default -> expected.equals(actual);
         };
         return same ? null : "reference " + expected + " but shard " + actual;
     }

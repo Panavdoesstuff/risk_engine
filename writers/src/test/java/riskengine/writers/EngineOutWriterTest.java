@@ -35,6 +35,9 @@ import riskengine.host.RedpandaLogs;
 import riskengine.host.ShardHost;
 import riskengine.host.Topics;
 import riskengine.margin.AccountBook;
+import riskengine.margin.AccountStatusChange;
+import riskengine.margin.EpisodeChange;
+import riskengine.margin.SquareOffLeg;
 import riskengine.margin.EngineOutput;
 import riskengine.margin.MarginEvent;
 import riskengine.margin.OrderClosure;
@@ -80,9 +83,14 @@ class EngineOutWriterTest {
         try (Connection c = db(); Statement st = c.createStatement()) {
             for (String sql : List.of(
                     "SELECT 'position', account_id, instrument_id, net_qty, avg_price, last_event_seq FROM positions ORDER BY 2, 3",
-                    "SELECT 'account', id, cash_balance, last_event_seq FROM accounts ORDER BY 2",
-                    "SELECT 'order', id, account_id, instrument_id, side, qty, status, reject_reason, last_event_seq FROM orders ORDER BY 2",
-                    "SELECT 'margin', account_id, tick_seq, required, available, utilisation, status_from, status_to, action FROM margin_events ORDER BY 2, 3",
+                    "SELECT 'account', id, cash_balance, last_event_seq, status, status_event_seq FROM accounts ORDER BY 2",
+                    "SELECT 'order', id, account_id, instrument_id, side, qty, origin, status, reject_reason, required_after, available_after, last_event_seq FROM orders ORDER BY 2",
+                    "SELECT 'margin', account_id, source_offset, tick_seq, required, available, utilisation, expected_utilisation, status_from, status_to, action FROM margin_events ORDER BY 2, 3",
+                    "SELECT 'episode', episode_id, account_id, status, mode, actor, legs, started_tick_seq, ended_tick_seq FROM square_off_episodes ORDER BY 2",
+                    "SELECT 'leg', leg_key, episode_id, seq, qty, expected_release, status, mark, last_event_seq FROM square_off_legs ORDER BY 2",
+                    "SELECT 'outbox', idempotency_key, order_id, event_type, payload::text, sent_at FROM outbox ORDER BY 2",
+                    "SELECT 'fill', broker_fill_id, order_id, qty, price FROM fills ORDER BY 2",
+                    "SELECT 'ledger', txn_id, account, account_id, amount, reason, ref_id FROM ledger_entries ORDER BY 2, 3",
                     "SELECT 'audit', event_key, actor, action, account_id, tick_seq, reason, request_id, details::text FROM audit_log ORDER BY 2")) {
                 try (ResultSet rs = st.executeQuery(sql)) {
                     int cols = rs.getMetaData().getColumnCount();
@@ -142,9 +150,13 @@ class EngineOutWriterTest {
         long margins = expected.stream().filter(o -> o instanceof MarginEvent).count();
         long decisions = expected.stream().filter(o -> o instanceof OrderDecision).count();
         long closures = expected.stream().filter(o -> o instanceof OrderClosure).count();
+        long legs = expected.stream().filter(o -> o instanceof SquareOffLeg).count();
+        long episodes = expected.stream().filter(o -> o instanceof EpisodeChange).count();
+        long statuses = expected.stream().filter(o -> o instanceof AccountStatusChange).count();
         Map<String, String> expectedStatus = new TreeMap<>();
         for (EngineOutput o : expected) {
             if (o instanceof OrderDecision d && !d.accountId().equals("A-GHOST")) expectedStatus.put(d.orderId(), d.accepted() ? "ACCEPTED" : "REJECTED");
+            if (o instanceof SquareOffLeg l) expectedStatus.put(l.legKey(), "ACCEPTED"); // a leg is an order too, waiting to be sent
             if (o instanceof OrderClosure c && c.released() != 0) expectedStatus.put(c.orderId(), c.reason() == OrderClosed.Reason.REJECTED ? "BROKER_REJECTED" : "CANCELLED");
         }
         assertTrue(margins > 50 && decisions > 20 && expectedStatus.containsValue("CANCELLED") && expectedStatus.containsValue("ACCEPTED")
@@ -166,7 +178,27 @@ class EngineOutWriterTest {
 
             // Rows that are inserted once.
             assertEquals(margins, count("SELECT count(*) FROM margin_events"));
-            assertEquals(margins + decisions + closures, count("SELECT count(*) FROM audit_log"));
+            assertEquals(margins + decisions + closures + legs + episodes + statuses, count("SELECT count(*) FROM audit_log"), "one audit row per engine decision");
+            // Square-off: every leg has its order row and its outbox row (written in the same transaction), every
+            // accepted user order has an outbox row too, and episodes and account statuses match the engine.
+            assertTrue(legs > 5 && episodes > 5, "the stream squares accounts off: " + legs + " legs, " + episodes + " episode changes");
+            assertEquals(legs, count("SELECT count(*) FROM square_off_legs l JOIN orders o ON o.id = l.leg_key AND o.origin = 'SQUARE_OFF' AND o.idempotency_key = l.leg_key "
+                    + "JOIN outbox x ON x.idempotency_key = l.leg_key AND x.order_id = o.id AND x.payload->>'key' = l.leg_key"));
+            long acceptedOrders = expected.stream().filter(o -> o instanceof OrderDecision d && d.accepted()).count();
+            assertEquals(legs + acceptedOrders, count("SELECT count(*) FROM outbox WHERE sent_at IS NULL"));
+            assertEquals(expected.stream().filter(o -> o instanceof EpisodeChange e && e.state() == EpisodeChange.State.OPENED).count(), count("SELECT count(*) FROM square_off_episodes"));
+            Map<String, String> engineStatus = new TreeMap<>(), pgStatus = new TreeMap<>();
+            for (AccountBook b : books) engineStatus.put(b.id(), reference.status(b.id()).name());
+            try (Connection c = db(); Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT id, status FROM accounts")) {
+                while (rs.next()) pgStatus.put(rs.getString(1), rs.getString(2));
+            }
+            assertEquals(engineStatus, pgStatus, "accounts.status");
+            assertTrue(pgStatus.containsValue("SQUARING_OFF") && pgStatus.containsValue("MARGIN_CALL"), pgStatus.values().toString());
+            // Fills and the ledger. Every transaction sums to zero (the schema would refuse it otherwise).
+            long fillsForKnownOrders = count("SELECT count(*) FROM fills");
+            assertEquals(0, fillsForKnownOrders, "no fill in this stream belongs to an order Postgres has, so none is stored");
+            assertTrue(count("SELECT count(DISTINCT txn_id) FROM ledger_entries") > 500);
+            assertEquals(0, count("SELECT count(*) FROM (SELECT txn_id FROM ledger_entries GROUP BY txn_id HAVING sum(amount) <> 0 OR count(*) <> 2) t"));
             assertEquals(1, count("SELECT count(*) FROM audit_log WHERE request_id = 'O-ghost' AND account_id IS NULL AND action = 'ORDER_REJECTED' AND reason = 'UNKNOWN_ACCOUNT'"));
             assertEquals(1, writer.skipped(), "only the ghost account's order row");
             // Order status.
@@ -206,8 +238,8 @@ class EngineOutWriterTest {
             await("the writer to read the replay", () -> writer.records() == 2L * expected.size());
             assertEquals(before, snapshot(), "replaying every output is a no-op");
             assertEquals(0, writer.failedBatches());
-            System.out.printf("writers: %d outputs projected (%d margin events, %d decisions, %d closures, %d position changes) in %d batches; replay of all %d changed nothing%n",
-                    expected.size(), margins, decisions, closures, expected.stream().filter(o -> o instanceof PositionChange).count(), writer.batches(), expected.size());
+            System.out.printf("writers: %d outputs projected (%d level changes, %d decisions, %d closures, %d position changes, %d legs, %d episode changes, %d status changes) in %d batches; replay of all %d changed nothing%n",
+                    expected.size(), margins, decisions, closures, expected.stream().filter(o -> o instanceof PositionChange).count(), legs, episodes, statuses, writer.batches(), expected.size());
         }
     }
 
@@ -220,9 +252,12 @@ class EngineOutWriterTest {
                 st.execute("INSERT INTO accounts (id, cash_balance) VALUES ('GUARD', 1000) ON CONFLICT DO NOTHING");
             }
             Projection projection = new Projection();
-            PositionChange older = new PositionChange("GUARD", "NIFTY-20240627-FUT", 25, new BigDecimal("23000"), new BigDecimal("1000"), "F1", 1);
-            PositionChange newer = new PositionChange("GUARD", "NIFTY-20240627-FUT", 75, new BigDecimal("23100"), new BigDecimal("900"), "F2", 2);
-            OrderDecision accepted = new OrderDecision("O-guard", "GUARD", "NIFTY-20240627-FUT", OrderRequest.Side.BUY, 25, true, OrderDecision.Reason.OK, 1, 1, 10, 100, 0.1);
+            PositionChange older = new PositionChange("GUARD", "NIFTY-20240627-FUT", 25, new BigDecimal("23000"), new BigDecimal("1000"), "GF-1", "O-guard", 25,
+                    new BigDecimal("23000"), BigDecimal.ZERO, 0, 1);
+            PositionChange newer = new PositionChange("GUARD", "NIFTY-20240627-FUT", 75, new BigDecimal("23100"), new BigDecimal("900"), "GF-2", "O-other", 50,
+                    new BigDecimal("23150"), new BigDecimal("-100"), PositionChange.NOT_TRACKED, 2);
+            OrderDecision accepted = new OrderDecision("O-guard", "GUARD", "NIFTY-20240627-FUT", OrderRequest.Side.BUY, 25, true, OrderDecision.Reason.OK, 1, 1, 10, 100, 0.1,
+                    new BigDecimal("23000"));
             OrderClosure closed = new OrderClosure("O-guard", "GUARD", OrderClosed.Reason.REJECTED, 25, 2);
 
             // Newer first (offsets 7 and 8), then the older ones (offsets 3 and 4) arrive late, as in a replay.
@@ -234,6 +269,12 @@ class EngineOutWriterTest {
         assertEquals(1, count("SELECT count(*) FROM accounts WHERE id = 'GUARD' AND cash_balance = 900 AND last_event_seq = 7"));
         assertEquals(1, count("SELECT count(*) FROM orders WHERE id = 'O-guard' AND status = 'BROKER_REJECTED' AND reject_reason = 'REJECTED' AND last_event_seq = 8"));
         assertEquals(1, count("SELECT count(*) FROM audit_log WHERE event_key = 'DECISION:O-guard'"), "the decision is audited once, however often it is published");
+        assertEquals(1, count("SELECT count(*) FROM outbox WHERE idempotency_key = 'O-guard'"), "and sent to the broker once: one outbox row");
+        assertEquals(1, count("SELECT count(*) FROM fills WHERE broker_fill_id = 'GF-1' AND order_id = 'O-guard'"), "a fill for a known order is stored once");
+        assertEquals(0, count("SELECT count(*) FROM fills WHERE broker_fill_id = 'GF-2'"), "a fill for an order Postgres does not have is not");
+        assertEquals(2, count("SELECT count(*) FROM ledger_entries WHERE txn_id = 'FILL:GF-2'"), "the realised loss is booked once, as two rows");
+        assertEquals(0, count("SELECT coalesce(sum(amount), 0) FROM ledger_entries WHERE txn_id = 'FILL:GF-2'"));
+        assertEquals(0, count("SELECT count(*) FROM ledger_entries WHERE txn_id = 'FILL:GF-1'"), "a fill that moved no cash books nothing");
     }
 
     @Test

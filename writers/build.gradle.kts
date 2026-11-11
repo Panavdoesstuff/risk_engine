@@ -11,6 +11,7 @@ dependencies {
     runtimeOnly("org.slf4j:slf4j-simple:2.0.17")
 
     testImplementation(testFixtures(project(":engine")))
+    testImplementation(project(":broker-mock"))
     testImplementation(platform("org.testcontainers:testcontainers-bom:1.21.4"))
     testImplementation("org.testcontainers:junit-jupiter")
     testImplementation("org.testcontainers:redpanda")
@@ -30,4 +31,7 @@ tasks.named<JavaExec>("run") {
 tasks.withType<Test>().configureEach {
     // Tests apply the real migrations.
     systemProperty("migrations.dir", rootDir.resolve("db/migrations").absolutePath)
+    // Size of the chaos run: ./gradlew :writers:test --tests '*SquareOffChaosTest' -Dchaos.accounts=2000
+    listOf("chaos.accounts", "chaos.ticks").forEach { k -> System.getProperty(k)?.let { systemProperty(k, it) } }
+    maxHeapSize = "2g"
 }

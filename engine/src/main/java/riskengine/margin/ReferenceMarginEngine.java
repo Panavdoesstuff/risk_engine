@@ -9,6 +9,7 @@ import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.function.Consumer;
+import riskengine.events.AccountControl;
 import riskengine.events.Event;
 import riskengine.events.EventLog;
 import riskengine.events.Fill;
@@ -45,7 +46,8 @@ public final class ReferenceMarginEngine {
         final BigDecimal collateral;
         final SortedMap<String, Position> positions;
         final SortedMap<String, PendingOrder> pending = new TreeMap<>();
-        final MarginStatusTracker tracker;
+        final AccountRisk risk;
+        AccountView view;
         MarginResult latest;
 
         Account(AccountBook b, Thresholds t) {
@@ -53,7 +55,7 @@ public final class ReferenceMarginEngine {
             this.cash = b.cash();
             this.collateral = b.collateral();
             this.positions = new TreeMap<>(b.positions());
-            this.tracker = new MarginStatusTracker(t);
+            this.risk = new AccountRisk(b.id(), t);
         }
     }
 
@@ -73,9 +75,9 @@ public final class ReferenceMarginEngine {
         for (Instrument i : instruments) this.instruments.put(i.id(), i);
         for (AccountBook b : books) {
             for (String id : b.positions().keySet()) instrument(id, b.id());
-            if (accounts.put(b.id(), new Account(b, cfg.thresholds())) != null) {
-                throw new IllegalArgumentException("duplicate account " + b.id());
-            }
+            Account a = new Account(b, cfg.thresholds());
+            a.view = new View(a);
+            if (accounts.put(b.id(), a) != null) throw new IllegalArgumentException("duplicate account " + b.id());
         }
         cfg.underlyings().forEach((u, p) -> grids.put(u, new ScenarioGrid(p)));
     }
@@ -90,10 +92,11 @@ public final class ReferenceMarginEngine {
     /** Applies one event; returns level changes in account-id order (ticks) or the order's decision. */
     public List<EngineOutput> apply(Event e) {
         return switch (e) {
-            case Tick t -> List.copyOf(onTick(t));
+            case Tick t -> onTick(t);
             case Fill f -> onFill(f);
             case OrderRequest o -> onOrder(o);
             case OrderClosed c -> onClosed(c);
+            case AccountControl c -> onControl(c);
             case SquareOffResult s -> List.of();
         };
     }
@@ -103,6 +106,8 @@ public final class ReferenceMarginEngine {
         if (!seenOrderIds.add(o.orderId())) return List.of();
         Account a = accounts.get(o.accountId());
         if (a == null) return List.of(OrderDecision.rejected(o, OrderDecision.Reason.UNKNOWN_ACCOUNT, lastTickSeq));
+        OrderDecision.Reason gate = a.risk.orderGate();
+        if (gate != null) return List.of(OrderDecision.rejected(o, gate, lastTickSeq));
         Instrument i = instruments.get(o.instrumentId());
         OrderDecision.Reason bad = PreTradeCheck.structuralReject(i, cfg, o);
         if (bad != null) return List.of(OrderDecision.rejected(o, bad, lastTickSeq));
@@ -112,19 +117,28 @@ public final class ReferenceMarginEngine {
         if (before == null || after == null) return List.of(OrderDecision.rejected(o, OrderDecision.Reason.NO_MARKET, lastTickSeq));
         boolean ok = PreTradeCheck.passes(before, after, cfg.thresholds());
         if (ok) a.pending.put(o.orderId(), new PendingOrder(i.id(), qty));
-        return List.of(OrderDecision.checked(o, ok, lastTickSeq, after));
+        return List.of(OrderDecision.checked(o, ok, lastTickSeq, after, PreTradeCheck.mark(array(i).price())));
     }
 
     /** Margin if every reserved order (plus one extra, if given) filled now at the mark. Null if unpriceable. */
     private MarginResult whatIf(Account a, String extraInstrumentId, long extraQty, SortedMap<String, RiskArray> arrays) {
+        return marginWith(a, PreTradeCheck.netDeltas(a.pending.values(), extraInstrumentId, extraQty));
+    }
+
+    private RiskArray array(Instrument i) {
+        MarketState m = markets.get(i.underlying());
+        return arrays.computeIfAbsent(i.id(), id -> RiskArray.compute(i, m, grids.get(i.underlying()), cfg.riskFreeRate()));
+    }
+
+    /** Margin if the given signed quantities filled now at the mark: rebuilt from the hypothetical positions. Null if unpriceable. */
+    private MarginResult marginWith(Account a, SortedMap<String, Long> deltas) {
         SortedMap<String, Position> positions = new TreeMap<>(a.positions);
         BigDecimal cash = a.cash;
-        for (var d : PreTradeCheck.netDeltas(a.pending.values(), extraInstrumentId, extraQty).entrySet()) {
+        for (var d : deltas.entrySet()) {
             if (d.getValue() == 0) continue;
             Instrument i = instruments.get(d.getKey());
-            MarketState m = markets.get(i.underlying());
-            if (m == null) return null;
-            RiskArray array = arrays.computeIfAbsent(i.id(), id -> RiskArray.compute(i, m, grids.get(i.underlying()), cfg.riskFreeRate()));
+            if (!markets.containsKey(i.underlying())) return null;
+            RiskArray array = array(i);
             PositionAccounting.Outcome o = PositionAccounting.apply(i.type(), positions.getOrDefault(i.id(), Position.FLAT),
                     d.getValue(), PreTradeCheck.mark(array.price()));
             if (o.position().qty() == 0) positions.remove(i.id());
@@ -134,7 +148,7 @@ public final class ReferenceMarginEngine {
         return margin(positions, cash, a.collateral, arrays);
     }
 
-    public List<MarginEvent> onTick(Tick t) {
+    public List<EngineOutput> onTick(Tick t) {
         if (t.tickSeq() <= lastTickSeq) {
             throw new IllegalStateException("tick " + t.tickSeq() + " after " + lastTickSeq + ": ticks must be strictly increasing");
         }
@@ -143,14 +157,13 @@ public final class ReferenceMarginEngine {
         markets.put(t.underlying(), new MarketState(t.underlying(), t.spot().doubleValue(), t.vix().doubleValue() * p.volScale(), t.logTimeMillis()));
 
         arrays = new TreeMap<>(); // priced once per instrument per tick
-        List<MarginEvent> events = new ArrayList<>();
+        List<EngineOutput> events = new ArrayList<>();
         for (Account a : accounts.values()) {
             if (!holds(a, t.underlying())) continue;
             MarginResult r = margin(a.positions, a.cash, a.collateral, arrays);
             if (r == null) continue;
             a.latest = r;
-            MarginLevel before = a.tracker.level(), after = a.tracker.onReading(r.utilisation());
-            if (after != before) events.add(new MarginEvent(a.id, t.tickSeq(), t.logTimeMillis(), r, before, after));
+            a.risk.onTick(a.view, r, t.tickSeq(), t.logTimeMillis(), events);
         }
         return events;
     }
@@ -158,8 +171,59 @@ public final class ReferenceMarginEngine {
     /** Releases whatever the order still had reserved. */
     public List<EngineOutput> onClosed(OrderClosed c) {
         Account a = accounts.get(c.accountId());
-        PendingOrder p = a == null ? null : a.pending.remove(c.orderId());
-        return List.of(new OrderClosure(c.orderId(), c.accountId(), c.reason(), p == null ? 0 : p.remaining(), c.logTimeMillis()));
+        if (a == null) return List.of(new OrderClosure(c.orderId(), c.accountId(), c.reason(), 0, c.logTimeMillis()));
+        PendingOrder p = a.pending.remove(c.orderId());
+        List<EngineOutput> after = new ArrayList<>();
+        long leg = a.risk.onClosed(a.view, c.orderId(), lastTickSeq, c.logTimeMillis(), after);
+        List<EngineOutput> out = new ArrayList<>();
+        out.add(new OrderClosure(c.orderId(), c.accountId(), c.reason(), p != null ? p.remaining() : leg, c.logTimeMillis()));
+        out.addAll(after);
+        return out;
+    }
+
+    public List<EngineOutput> onControl(AccountControl c) {
+        Account a = accounts.get(c.accountId());
+        if (a == null) return List.of();
+        List<EngineOutput> out = new ArrayList<>();
+        a.risk.onControl(c, a.view, lastTickSeq, out);
+        return out;
+    }
+
+    /** How AccountRisk and the leg planner see an account here: every answer rebuilt from positions. */
+    private final class View implements AccountView {
+        private final Account a;
+
+        View(Account a) {
+            this.a = a;
+        }
+
+        @Override
+        public SortedMap<String, Position> positions() {
+            return a.positions;
+        }
+
+        @Override
+        public Instrument instrument(String instrumentId) {
+            return instruments.get(instrumentId);
+        }
+
+        @Override
+        public MarginResult margin(SortedMap<String, Long> deltas) {
+            return marginWith(a, deltas);
+        }
+
+        @Override
+        public BigDecimal mark(String instrumentId) {
+            return PreTradeCheck.mark(array(instruments.get(instrumentId)).price());
+        }
+
+        @Override
+        public void cancelReservations(List<EngineOutput> out, long logTimeMillis) {
+            for (var e : a.pending.entrySet()) {
+                out.add(new OrderClosure(e.getKey(), a.id, OrderClosed.Reason.CANCELLED, e.getValue().remaining(), logTimeMillis));
+            }
+            a.pending.clear();
+        }
     }
 
     public List<EngineOutput> onFill(Fill f) {
@@ -171,15 +235,23 @@ public final class ReferenceMarginEngine {
         if (o.position().qty() == 0) a.positions.remove(i.id());
         else a.positions.put(i.id(), o.position());
         a.cash = a.cash.add(o.cashDelta());
+        long orderRemaining = PositionChange.NOT_TRACKED;
         PendingOrder p = a.pending.get(f.orderId());
         if (p != null && p.instrumentId().equals(i.id())) {
-            long left = PreTradeCheck.remainingAfterFill(p.remaining(), f.qty());
-            if (left == 0) a.pending.remove(f.orderId());
-            else a.pending.put(f.orderId(), new PendingOrder(p.instrumentId(), left));
+            orderRemaining = PreTradeCheck.remainingAfterFill(p.remaining(), f.qty());
+            if (orderRemaining == 0) a.pending.remove(f.orderId());
+            else a.pending.put(f.orderId(), new PendingOrder(p.instrumentId(), orderRemaining));
         }
         MarginResult r = margin(a.positions, a.cash, a.collateral, arrays);
         if (r != null) a.latest = r;
-        return List.of(new PositionChange(a.id, i.id(), o.position().qty(), o.position().avgPrice(), a.cash, f.fillId(), f.logTimeMillis()));
+        List<EngineOutput> after = new ArrayList<>();
+        long legRemaining = a.risk.onFill(a.view, f.orderId(), f.qty(), r, lastTickSeq, f.logTimeMillis(), after);
+        if (legRemaining != PositionChange.NOT_TRACKED) orderRemaining = legRemaining;
+        List<EngineOutput> out = new ArrayList<>();
+        out.add(new PositionChange(a.id, i.id(), o.position().qty(), o.position().avgPrice(), a.cash, f.fillId(), f.orderId(), f.qty(), f.price(),
+                o.cashDelta(), orderRemaining, f.logTimeMillis()));
+        out.addAll(after);
+        return out;
     }
 
     private boolean holds(Account a, String underlying) {
@@ -222,7 +294,15 @@ public final class ReferenceMarginEngine {
     }
 
     public MarginLevel level(String accountId) {
-        return accounts.get(accountId).tracker.level();
+        return accounts.get(accountId).risk.level();
+    }
+
+    public String riskFingerprint(String accountId) {
+        return accounts.get(accountId).risk.fingerprint();
+    }
+
+    public AccountRisk.Status status(String accountId) {
+        return accounts.get(accountId).risk.status();
     }
 
     public BigDecimal cash(String accountId) {

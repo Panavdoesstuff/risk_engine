@@ -12,6 +12,7 @@ import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import riskengine.events.AccountControl;
 import riskengine.events.Fill;
 import riskengine.events.LoggedEvent;
 import riskengine.events.OrderClosed;
@@ -19,6 +20,8 @@ import riskengine.events.OrderRequest;
 import riskengine.events.SquareOffResult;
 import riskengine.events.Tick;
 import riskengine.margin.AccountBook;
+import riskengine.margin.AccountRisk;
+import riskengine.margin.AccountView;
 import riskengine.margin.AccountVector;
 import riskengine.margin.MarginCalculator;
 import riskengine.margin.EngineOutput;
@@ -26,7 +29,6 @@ import riskengine.margin.MarginConfig;
 import riskengine.margin.MarginEvent;
 import riskengine.margin.MarginLevel;
 import riskengine.margin.MarginResult;
-import riskengine.margin.MarginStatusTracker;
 import riskengine.margin.MarketState;
 import riskengine.margin.OrderClosure;
 import riskengine.margin.OrderDecision;
@@ -97,14 +99,54 @@ public final class ShardState {
             if (now == 0) reservedNet.remove(instrumentId);
             else reservedNet.put(instrumentId, now);
         }
-        final MarginStatusTracker tracker;
+        /** Level, status and square-off episode: the state machine shared with the reference engine. */
+        final AccountRisk risk;
+        AccountView view;
         MarginResult latest;
 
         Account(AccountBook b, MarginConfig cfg) {
             this.id = b.id();
             this.cash = b.cash();
             this.collateral = b.collateral();
-            this.tracker = new MarginStatusTracker(cfg.thresholds());
+            this.risk = new AccountRisk(b.id(), cfg.thresholds());
+        }
+    }
+
+    /** How {@link AccountRisk} and the leg planner see one of this shard's accounts. */
+    private final class View implements AccountView {
+        private final Account a;
+
+        View(Account a) {
+            this.a = a;
+        }
+
+        @Override
+        public SortedMap<String, Position> positions() {
+            return a.positions;
+        }
+
+        @Override
+        public Instrument instrument(String instrumentId) {
+            return instruments.get(instrumentId);
+        }
+
+        @Override
+        public MarginResult margin(SortedMap<String, Long> deltas) {
+            return fullyPriced(a) ? marginWith(a, deltas) : null;
+        }
+
+        @Override
+        public BigDecimal mark(String instrumentId) {
+            return PreTradeCheck.mark(arrayFor(instruments.get(instrumentId)).price());
+        }
+
+        @Override
+        public void cancelReservations(List<EngineOutput> out, long logTimeMillis) {
+            for (var e : a.pending.entrySet()) {
+                out.add(new OrderClosure(e.getKey(), a.id, OrderClosed.Reason.CANCELLED, e.getValue().remaining(), logTimeMillis));
+            }
+            a.pending.clear();
+            a.reservedNet.clear();
         }
     }
 
@@ -157,6 +199,7 @@ public final class ShardState {
         cfg.underlyings().forEach((u, p) -> grids.put(u, new ScenarioGrid(p)));
         for (AccountBook b : new TreeMap<>(byId(books)).values()) {
             Account a = new Account(b, cfg);
+            a.view = new View(a);
             accounts.put(a.id, a);
             for (var e : b.positions().entrySet()) {
                 if (e.getValue().qty() == 0) continue;
@@ -199,7 +242,8 @@ public final class ShardState {
             case Fill f -> onFill(f);
             case OrderRequest o -> onOrder(o);
             case OrderClosed c -> onClosed(c);
-            case SquareOffResult s -> List.of(); // square-off pipeline arrives in M5
+            case AccountControl c -> onControl(c);
+            case SquareOffResult s -> List.of(); // not used: a leg's outcome arrives as Fill or OrderClosed
         };
         nextOffset++;
         return out;
@@ -239,8 +283,8 @@ public final class ShardState {
                 if (!fullyPriced(a)) continue;
                 MarginResult r = margin(a);
                 a.latest = r;
-                MarginLevel before = a.tracker.level(), after = a.tracker.onReading(r.utilisation());
-                if (after != before) events.add(new MarginEvent(a.id, t.tickSeq(), t.logTimeMillis(), r, before, after));
+                // Level, status and square-off: may emit a level change, open or end an episode, plan a leg.
+                a.risk.onTick(a.view, r, t.tickSeq(), t.logTimeMillis(), events);
             }
         }
         return events;
@@ -284,13 +328,33 @@ public final class ShardState {
             h.avgPrice = now.avgPrice().doubleValue();
         }
         a.cash = a.cash.add(o.cashDelta());
+        long orderRemaining = PositionChange.NOT_TRACKED;
         PendingOrder p = a.pending.get(f.orderId());
         if (p != null && p.instrumentId().equals(i.id())) {
             // This fill belongs to an accepted order: release that much of its reservation.
-            a.setRemaining(f.orderId(), p, PreTradeCheck.remainingAfterFill(p.remaining(), f.qty()));
+            orderRemaining = PreTradeCheck.remainingAfterFill(p.remaining(), f.qty());
+            a.setRemaining(f.orderId(), p, orderRemaining);
         }
-        if (fullyPriced(a)) a.latest = margin(a);
-        return List.of(new PositionChange(a.id, i.id(), now.qty(), now.avgPrice(), a.cash, f.fillId(), f.logTimeMillis()));
+        MarginResult actual = fullyPriced(a) ? margin(a) : null;
+        if (actual != null) a.latest = actual;
+        // If this was the square-off leg in flight, the episode moves on: ends, or plans the next leg.
+        List<EngineOutput> after = new ArrayList<>();
+        long legRemaining = a.risk.onFill(a.view, f.orderId(), f.qty(), actual, lastTickSeq, f.logTimeMillis(), after);
+        if (legRemaining != PositionChange.NOT_TRACKED) orderRemaining = legRemaining;
+        List<EngineOutput> out = new ArrayList<>();
+        out.add(new PositionChange(a.id, i.id(), now.qty(), now.avgPrice(), a.cash, f.fillId(), f.orderId(), f.qty(), f.price(),
+                o.cashDelta(), orderRemaining, f.logTimeMillis()));
+        out.addAll(after);
+        return out;
+    }
+
+    /** A risk-ops instruction: block, unblock, or square the account off. Unknown accounts are ignored. */
+    private List<EngineOutput> onControl(AccountControl c) {
+        Account a = accounts.get(c.accountId());
+        if (a == null) return List.of();
+        List<EngineOutput> out = new ArrayList<>();
+        a.risk.onControl(c, a.view, lastTickSeq, out);
+        return out;
     }
 
     /**
@@ -299,9 +363,16 @@ public final class ShardState {
      */
     private List<EngineOutput> onClosed(OrderClosed c) {
         Account a = accounts.get(c.accountId());
-        PendingOrder p = a == null ? null : a.pending.get(c.orderId());
+        if (a == null) return List.of(new OrderClosure(c.orderId(), c.accountId(), c.reason(), 0, c.logTimeMillis()));
+        PendingOrder p = a.pending.get(c.orderId());
         if (p != null) a.setRemaining(c.orderId(), p, 0);
-        return List.of(new OrderClosure(c.orderId(), c.accountId(), c.reason(), p == null ? 0 : p.remaining(), c.logTimeMillis()));
+        // Or it was the square-off leg in flight (the broker rejected it): drop it and plan again.
+        List<EngineOutput> after = new ArrayList<>();
+        long leg = a.risk.onClosed(a.view, c.orderId(), lastTickSeq, c.logTimeMillis(), after);
+        List<EngineOutput> out = new ArrayList<>();
+        out.add(new OrderClosure(c.orderId(), c.accountId(), c.reason(), p != null ? p.remaining() : leg, c.logTimeMillis()));
+        out.addAll(after);
+        return out;
     }
 
     // ---------------------------------------------------------------- pre-trade check
@@ -315,13 +386,15 @@ public final class ShardState {
      * an exception.
      */
     private List<EngineOutput> onOrder(OrderRequest o) {
-        if (o.origin() != OrderRequest.Origin.USER) return List.of(); // the engine's own square-off orders: M5
+        if (o.origin() != OrderRequest.Origin.USER) return List.of(); // square-off legs never enter as order events
         if (!seenOrderIds.add(o.orderId())) {
             duplicateOrders++; // the same request written twice (an API retry): decided once
             return List.of();
         }
         Account a = accounts.get(o.accountId());
         if (a == null) return List.of(OrderDecision.rejected(o, OrderDecision.Reason.UNKNOWN_ACCOUNT, lastTickSeq));
+        OrderDecision.Reason gate = a.risk.orderGate(); // blocked, or being squared off
+        if (gate != null) return List.of(OrderDecision.rejected(o, gate, lastTickSeq));
         Instrument i = instruments.get(o.instrumentId());
         OrderDecision.Reason bad = PreTradeCheck.structuralReject(i, cfg, o);
         if (bad != null) return List.of(OrderDecision.rejected(o, bad, lastTickSeq));
@@ -333,17 +406,11 @@ public final class ShardState {
         MarginResult after = whatIf(a, i.id(), qty);
         boolean ok = PreTradeCheck.passes(before, after, cfg.thresholds());
         if (ok) a.reserve(o.orderId(), new PendingOrder(i.id(), qty));
-        return List.of(OrderDecision.checked(o, ok, lastTickSeq, after));
+        return List.of(OrderDecision.checked(o, ok, lastTickSeq, after, PreTradeCheck.mark(arrayFor(i).price())));
     }
 
-    /**
-     * Margin if every reserved order (plus one extra, if given) filled now at the mark. Works on copies of
-     * the account's vectors: the same remove-old / add-new steps a real fill takes, without touching state.
-     */
+    /** Margin if every reserved order (plus one extra, if given) filled now at the mark. */
     private MarginResult whatIf(Account a, String extraInstrumentId, long extraQty) {
-        TreeMap<String, AccountVector> vectors = new TreeMap<>();
-        for (AccountVector v : a.vectors.values()) vectors.put(v.underlying(), v.copy());
-        BigDecimal cash = a.cash;
         // The reserved quantities per instrument, plus the extra order. (The reference engine gets the same
         // numbers by adding up every open order each time.)
         TreeMap<String, Long> deltas = a.reservedNet;
@@ -351,12 +418,29 @@ public final class ShardState {
             deltas = new TreeMap<>(a.reservedNet);
             deltas.merge(extraInstrumentId, extraQty, Long::sum);
         }
+        return marginWith(a, deltas);
+    }
+
+    /** The risk array for an instrument at the current market: stored if anyone in the shard holds it, else computed. */
+    private RiskArray arrayFor(Instrument i) {
+        RiskArray array = arrays.get(i.id());
+        return array != null ? array : RiskArray.compute(i, markets.get(i.underlying()), grids.get(i.underlying()), cfg.riskFreeRate());
+    }
+
+    /**
+     * Margin if the given signed quantities filled now at the mark, on top of the real positions. Works on
+     * copies of the account's vectors: the same remove-old / add-new steps a real fill takes, without
+     * touching state.
+     */
+    private MarginResult marginWith(Account a, SortedMap<String, Long> deltas) {
+        TreeMap<String, AccountVector> vectors = new TreeMap<>();
+        for (AccountVector v : a.vectors.values()) vectors.put(v.underlying(), v.copy());
+        BigDecimal cash = a.cash;
         for (var d : deltas.entrySet()) {
             if (d.getValue() == 0) continue;
             Instrument i = instruments.get(d.getKey());
             String u = i.underlying();
-            RiskArray array = arrays.get(i.id()); // present if anyone in the shard holds it
-            if (array == null) array = RiskArray.compute(i, markets.get(u), grids.get(u), cfg.riskFreeRate());
+            RiskArray array = arrayFor(i);
             Position old = a.positions.getOrDefault(i.id(), Position.FLAT);
             PositionAccounting.Outcome o = PositionAccounting.apply(i.type(), old, d.getValue(), PreTradeCheck.mark(array.price()));
             AccountVector v = vectors.get(u);
@@ -486,7 +570,7 @@ public final class ShardState {
             }
             h.num(a.pending.size());
             for (var e : a.pending.entrySet()) h.str(e.getKey()).str(e.getValue().instrumentId()).num(e.getValue().remaining());
-            h.num(a.tracker.level().ordinal()).num(a.tracker.callStreak()).num(a.tracker.squareOffStreak());
+            h.str(a.risk.fingerprint());
             MarginResult r = a.latest;
             h.num(r == null ? 0 : 1);
             if (r != null) {
@@ -569,7 +653,21 @@ public final class ShardState {
     }
 
     public MarginLevel level(String accountId) {
-        return accounts.get(accountId).tracker.level();
+        return accounts.get(accountId).risk.level();
+    }
+
+    /** The account's level, status, episode and in-flight leg, as one comparable line. */
+    public String riskFingerprint(String accountId) {
+        return accounts.get(accountId).risk.fingerprint();
+    }
+
+    public AccountRisk.Status status(String accountId) {
+        return accounts.get(accountId).risk.status();
+    }
+
+    /** The square-off leg in flight for the account, or null. */
+    public AccountRisk.InFlight inFlight(String accountId) {
+        return accounts.get(accountId).risk.inFlight();
     }
 
     public BigDecimal cash(String accountId) {

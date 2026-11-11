@@ -18,7 +18,7 @@ import java.util.SortedMap;
  * @param examples           the first few mismatches, in words
  */
 public record StressReport(long records, SortedMap<String, Long> byType, long outputs, SortedMap<String, Long> decisions,
-                           long levelChanges, long releases, long duplicateFills, long duplicateOrders,
+                           long levelChanges, long releases, long episodes, long legs, long duplicateFills, long duplicateOrders,
                            long outputMismatches, long stateMismatches, long replayMismatches,
                            long maxLag, double liveSeconds, double referenceSeconds, List<String> examples) {
 
@@ -30,11 +30,12 @@ public record StressReport(long records, SortedMap<String, Long> byType, long ou
         return String.format("""
                 records written        %,d  %s
                 outputs compared       %,d  (order decisions %s; %,d level changes; %,d reservations released by a close)
+                square-off             %,d episodes, %,d legs planned (each filled or rejected by the harness's broker thread)
                 duplicates ignored     %,d fills, %,d orders
                 live run               %.1f s  (%,.0f records/s through the shards; max shard lag %,d records)
                 reference run          %.1f s  (single thread)
                 MISMATCHES             %,d  (outputs %,d, final account state %,d, replay hash %,d)%s""",
-                records, byType, outputs, decisions, levelChanges, releases, duplicateFills, duplicateOrders,
+                records, byType, outputs, decisions, levelChanges, releases, episodes, legs, duplicateFills, duplicateOrders,
                 liveSeconds, records / liveSeconds, maxLag, referenceSeconds,
                 mismatches(), outputMismatches, stateMismatches, replayMismatches,
                 examples.isEmpty() ? "" : "\n  " + String.join("\n  ", examples));

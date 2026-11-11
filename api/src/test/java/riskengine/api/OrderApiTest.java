@@ -91,7 +91,10 @@ class OrderApiTest {
         List<AccountBook> books = List.of(
                 new AccountBook("A-RICH", new BigDecimal("5000000"), BigDecimal.ZERO, new TreeMap<>()),
                 new AccountBook("A-POOR", new BigDecimal("20000"), BigDecimal.ZERO, new TreeMap<>()),
-                new AccountBook("A-VICTIM", new BigDecimal("5000000"), BigDecimal.ZERO, new TreeMap<>()));
+                new AccountBook("A-VICTIM", new BigDecimal("5000000"), BigDecimal.ZERO, new TreeMap<>()),
+                new AccountBook("A-BLOCKME", new BigDecimal("5000000"), BigDecimal.ZERO, new TreeMap<>()),
+                new AccountBook("A-HOLDER", new BigDecimal("5000000"), BigDecimal.ZERO,
+                        new TreeMap<>(java.util.Map.of("NIFTY-20240627-FUT", riskengine.margin.Position.of(50, "23300")))));
         // Postgres: the real migrations, then the same book the shards start from.
         try {
             Flyway.configure().dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())
@@ -101,7 +104,7 @@ class OrderApiTest {
             StringBuilder accounts = new StringBuilder("account_id,archetype,thin_funded,cash_balance\n");
             for (AccountBook b : books) accounts.append(b.id()).append(",TEST,false,").append(b.cash().toPlainString()).append('\n');
             Files.writeString(dir.resolve("accounts.csv"), accounts);
-            Files.writeString(dir.resolve("positions.csv"), "account_id,instrument_id,lots,qty,avg_price\n");
+            Files.writeString(dir.resolve("positions.csv"), "account_id,instrument_id,lots,qty,avg_price\nA-HOLDER,NIFTY-20240627-FUT,2,50,23300\n");
             BookLoader.load(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword(), dir.resolve("instruments.csv"), dir, LocalDate.of(2024, 6, 3));
         } catch (Exception e) {
             throw new ExceptionInInitializerError(e);
@@ -435,6 +438,83 @@ class OrderApiTest {
         assertEquals(before, ordersInLog("A-RICH").size(), "nothing malformed was written");
     }
 
+    // ---------------------------------------------------------------- risk-ops
+
+    MockHttpServletResponse control(String token, String account, String action, String requestId) throws Exception {
+        MockHttpServletRequestBuilder request = post("/accounts/" + account + "/" + action);
+        if (requestId != null) request.header("X-Request-Id", requestId);
+        return send(request, token);
+    }
+
+    String awaitAccountStatus(String account, String wanted) throws Exception {
+        String viewer = riskOps(newUser());
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        String status;
+        do {
+            Thread.sleep(250);
+            status = body(send(get("/accounts/" + account), viewer)).path("status").asText();
+        } while (!status.equals(wanted) && System.nanoTime() < deadline);
+        return status;
+    }
+
+    @Test
+    void riskOpsCanBlockAndUnblockAnAccountAndTradersCannot() throws Exception {
+        String opsUser = newUser();
+        String ops = riskOps(opsUser);
+        String owner = trader(newUser(), "A-BLOCKME");
+
+        assertRefused(control(owner, "A-BLOCKME", "block", newRequestId()), 403, "forbidden");
+        assertRefused(control(null, "A-BLOCKME", "block", newRequestId()), 401, "unauthenticated");
+        assertRefused(control(ops, "A-BLOCKME", "block", null), 400, "invalid_request");
+        assertRefused(control(ops, "A-NOBODY", "block", newRequestId()), 404, "not_found");
+
+        String requestId = newRequestId();
+        MockHttpServletResponse r = control(ops, "A-BLOCKME", "block", requestId);
+        assertEquals(202, r.getStatus(), r.getContentAsString());
+        assertEquals("BLOCK", body(r).path("action").asText());
+        assertRefused(control(ops, "A-BLOCKME", "block", requestId), 409, "replayed_request");
+        assertEquals("BLOCKED", awaitAccountStatus("A-BLOCKME", "BLOCKED"));
+
+        // The owner can see it, and their orders are now refused by the shard.
+        assertEquals("BLOCKED", body(send(get("/accounts/A-BLOCKME"), owner)).path("status").asText());
+        JsonNode refused = awaitDecision(body(submit(owner, newRequestId(), sellOneLot("A-BLOCKME"))).path("orderId").asText());
+        assertEquals("REJECTED", refused.path("status").asText());
+        assertEquals("ACCOUNT_BLOCKED", refused.path("reason").asText());
+        // Who did it is in the audit log.
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM audit_log WHERE account_id = 'A-BLOCKME' AND action = 'ACCOUNT_STATUS' "
+                + "AND actor = ? AND reason = 'BLOCKED_BY_RISK_OPS'", Integer.class, "risk-ops:" + opsUser));
+
+        assertEquals(202, control(ops, "A-BLOCKME", "unblock", newRequestId()).getStatus());
+        assertEquals("ACTIVE", awaitAccountStatus("A-BLOCKME", "ACTIVE"));
+        assertEquals("ACCEPTED", awaitDecision(body(submit(owner, newRequestId(), sellOneLot("A-BLOCKME"))).path("orderId").asText()).path("status").asText());
+
+        // Another trader cannot see this account at all.
+        assertRefused(send(get("/accounts/A-BLOCKME"), trader(newUser(), "A-RICH")), 404, "not_found");
+    }
+
+    @Test
+    void riskOpsCanSquareAnAccountOffByHand() throws Exception {
+        String opsUser = newUser();
+        String ops = riskOps(opsUser);
+        assertRefused(control(trader(newUser(), "A-HOLDER"), "A-HOLDER", "square-off", newRequestId()), 403, "forbidden");
+        assertEquals(202, control(ops, "A-HOLDER", "square-off", newRequestId()).getStatus());
+        assertEquals("SQUARING_OFF", awaitAccountStatus("A-HOLDER", "SQUARING_OFF"));
+
+        // The engine opened a manual episode in the risk-ops user's name and sent the first leg: an order
+        // with origin SQUARE_OFF whose id is the leg key, with its outbox row, waiting for the broker.
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM square_off_episodes WHERE account_id = 'A-HOLDER' AND mode = 'MANUAL' AND status = 'OPEN' AND actor = ?",
+                Integer.class, "risk-ops:" + opsUser));
+        String legKey = jdbc.queryForObject("SELECT leg_key FROM square_off_legs WHERE account_id = 'A-HOLDER'", String.class);
+        assertTrue(legKey.matches("A-HOLDER:E1:NIFTY-20240627-FUT:1"), legKey);
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM orders o JOIN outbox x ON x.order_id = o.id AND x.idempotency_key = o.id "
+                + "WHERE o.id = ? AND o.origin = 'SQUARE_OFF' AND o.side = 'SELL' AND o.qty = 50", Integer.class, legKey));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM audit_log WHERE account_id = 'A-HOLDER' AND action = 'SQUARE_OFF_OPENED' AND actor = ?",
+                Integer.class, "risk-ops:" + opsUser));
+        // While it is being squared off, its owner's orders are refused.
+        JsonNode refused = awaitDecision(body(submit(trader(newUser(), "A-HOLDER"), newRequestId(), sellOneLot("A-HOLDER"))).path("orderId").asText());
+        assertEquals("SQUARING_OFF", refused.path("reason").asText(), refused.toString());
+    }
+
     // ---------------------------------------------------------------- the asynchronous path, end to end
 
     @Test
@@ -453,6 +533,8 @@ class OrderApiTest {
         assertEquals("SELL", view.path("side").asText());
         assertEquals(25, view.path("qty").asLong());
         assertTrue(view.path("reason").isMissingNode() || view.path("reason").isNull(), "no reason on an accepted order: " + view);
+        assertTrue(view.path("requiredAfter").decimalValue().signum() > 0, "the margin the check computed: " + view);
+        assertTrue(view.path("availableAfter").decimalValue().compareTo(view.path("requiredAfter").decimalValue()) > 0, view.toString());
 
         // The same decision, straight from Postgres: the order row and one audit row.
         assertEquals("ACCEPTED", jdbc.queryForObject("SELECT status FROM orders WHERE id = ?", String.class, orderId));
@@ -471,6 +553,8 @@ class OrderApiTest {
         JsonNode noMargin = awaitDecision(body(submit(poor, newRequestId(), sellOneLot("A-POOR"))).path("orderId").asText());
         assertEquals("REJECTED", noMargin.path("status").asText(), noMargin.toString());
         assertEquals("INSUFFICIENT_MARGIN", noMargin.path("reason").asText());
+        assertTrue(noMargin.path("requiredAfter").decimalValue().compareTo(noMargin.path("availableAfter").decimalValue()) > 0,
+                "the answer shows how far short it was: " + noMargin);
 
         // Well-formed but not a whole number of lots: the API answers 202, the shard says no.
         String rich = trader(newUser(), "A-RICH");

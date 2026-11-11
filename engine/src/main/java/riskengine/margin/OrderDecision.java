@@ -11,10 +11,11 @@ import riskengine.events.OrderRequest;
  *                         at the current mark; 0 when the order was rejected before any margin was computed
  * @param availableAfter   available margin in that same what-if
  * @param utilisationAfter requiredAfter / availableAfter
+ * @param mark             the price the check assumed for the instrument (0 if it never got as far as pricing)
  */
 public record OrderDecision(String orderId, String accountId, String instrumentId, OrderRequest.Side side, long qty,
                             boolean accepted, Reason reason, long lastTickSeq, long logTimeMillis,
-                            double requiredAfter, double availableAfter, double utilisationAfter) implements EngineOutput {
+                            double requiredAfter, double availableAfter, double utilisationAfter, java.math.BigDecimal mark) implements EngineOutput {
 
     public enum Reason {
         /** Accepted. */
@@ -27,18 +28,22 @@ public record OrderDecision(String orderId, String accountId, String instrumentI
         BAD_LOT_SIZE,
         /** No tick yet for something the account holds or wants to trade, so nothing can be priced. */
         NO_MARKET,
+        /** Risk-ops (or a square-off that ran out of things to close) has blocked the account. */
+        ACCOUNT_BLOCKED,
+        /** The account is being squared off; no new orders until that ends. */
+        SQUARING_OFF,
         /** The trade would leave the account at or over 100% utilisation (or out of cash) and does not reduce its shortfall. */
         INSUFFICIENT_MARGIN
     }
 
     public static OrderDecision rejected(OrderRequest o, Reason reason, long lastTickSeq) {
         return new OrderDecision(o.orderId(), o.accountId(), o.instrumentId(), o.side(), o.qty(), false, reason,
-                lastTickSeq, o.logTimeMillis(), 0, 0, 0);
+                lastTickSeq, o.logTimeMillis(), 0, 0, 0, java.math.BigDecimal.ZERO);
     }
 
-    public static OrderDecision checked(OrderRequest o, boolean accepted, long lastTickSeq, MarginResult after) {
+    public static OrderDecision checked(OrderRequest o, boolean accepted, long lastTickSeq, MarginResult after, java.math.BigDecimal mark) {
         return new OrderDecision(o.orderId(), o.accountId(), o.instrumentId(), o.side(), o.qty(), accepted,
                 accepted ? Reason.OK : Reason.INSUFFICIENT_MARGIN, lastTickSeq, o.logTimeMillis(),
-                after.required(), after.available(), after.utilisation());
+                after.required(), after.available(), after.utilisation(), mark);
     }
 }

@@ -5,6 +5,9 @@ import java.util.List;
 
 /** Turns account vectors into a {@link MarginResult}. Pure function, no state. See MarginResult for the formula. */
 public final class MarginCalculator {
+    /** A requirement smaller than this (a millionth of a rupee) is rounding dust and counts as zero. */
+    public static final double REQUIRED_DUST_RUPEES = 1e-6;
+
     private MarginCalculator() {}
 
     public static MarginResult compute(AccountVector v, MarginConfig cfg, double cash, double collateral) {
@@ -48,6 +51,11 @@ public final class MarginCalculator {
         }
         // Both parts are already >= 0; the clamp states the rule and guards against floating-point dust.
         double required = Math.max(0, riskTotal + exposureTotal);
+        // Dust is not a requirement. A shard's vector is updated incrementally, so after a short position
+        // is closed its totals can be left at 1e-10 instead of 0 until the next rebuild. Without this, an
+        // account with nothing at risk and negative cash would show "something required, nothing
+        // available" = infinite utilisation, and be squared off for a ten-billionth of a rupee.
+        if (required < REQUIRED_DUST_RUPEES) required = 0;
         double available = cash + collateral + mtmTotal;
         return new MarginResult(worstTotal, worstScenario, somcTotal, spanTotal, novTotal, riskTotal, exposureTotal,
                 required, mtmTotal, available, utilisation(required, available));

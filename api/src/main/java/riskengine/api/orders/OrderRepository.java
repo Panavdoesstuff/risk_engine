@@ -53,8 +53,9 @@ public class OrderRepository {
 
     public Optional<OrderView> find(String orderId) {
         List<OrderView> rows = jdbc.query(
-                "SELECT id, account_id, instrument_id, side, qty, status, reject_reason FROM orders WHERE id = ?",
-                (rs, n) -> new OrderView(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4), rs.getLong(5), rs.getString(6), rs.getString(7)),
+                "SELECT id, account_id, instrument_id, side, qty, status, reject_reason, required_after, available_after FROM orders WHERE id = ?",
+                (rs, n) -> new OrderView(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4), rs.getLong(5), rs.getString(6), rs.getString(7),
+                        rs.getBigDecimal(8), rs.getBigDecimal(9)),
                 orderId);
         return rows.stream().findFirst();
     }

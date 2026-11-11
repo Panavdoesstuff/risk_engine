@@ -1,14 +1,15 @@
 # The risk engine on one machine.
 #
 #   docker compose up -d                  infrastructure only: Postgres (+ migrations), Redpanda (+ topics), Redis
-#   docker compose --profile app up -d    ... plus the engine: book loader, shard host, Postgres writers, order API
+#   docker compose --profile app up -d    ... plus the engine: book loader, shard host, Postgres writers, order API,
+#                                         outbox relay + fill ingester, and a mock broker (BROKER_CHAOS=full|none)
 #
 # The engine services need a start-of-day book under ./data (see data/README.md), which is why they are
 # behind a profile: the infrastructure must come up on a machine that has no data yet.
 # scripts/m4-e2e.sh runs the whole thing end to end with synthetic data.
 #
-# Host ports can be moved with POSTGRES_PORT, REDPANDA_PORT, REDPANDA_ADMIN_PORT, REDIS_PORT, API_PORT and
-# METRICS_PORT, so a second copy (docker compose -p other ...) can run beside this one.
+# Host ports can be moved with POSTGRES_PORT, REDPANDA_PORT, REDPANDA_ADMIN_PORT, REDIS_PORT, API_PORT,
+# METRICS_PORT and BROKER_PORT, so a second copy (docker compose -p other ...) can run beside this one.
 # Prometheus + Grafana are added in M6.
 
 name: risk-engine
@@ -54,7 +55,7 @@ services:
       test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
       interval: 2s
       timeout: 5s
-      retries: 30
+      retries: 90   # up to three minutes: a cold CI runner can take a while to start the broker
 
   topic-init:
     image: *redpanda-image
@@ -128,13 +129,33 @@ services:
       book-loader: { condition: service_completed_successfully }
       topic-init: { condition: service_completed_successfully }
 
+  # outbox -> broker (with timeout handling), and the broker's callbacks -> engine-events (the fill
+  # ingester, which refuses any callback that does not match an order we placed).
+  relay:
+    profiles: [app]
+    image: risk-engine-app
+    command: ["/opt/writers/bin/writers", "relay", "--broker-url", "http://broker:9300", "--listen-port", "9200",
+              "--partitions", "${ENGINE_PARTITIONS:-4}", "--bootstrap", "redpanda:9092", "--jdbc-url", "jdbc:postgresql://postgres:5432/risk"]
+    depends_on:
+      book-loader: { condition: service_completed_successfully }
+      topic-init: { condition: service_completed_successfully }
+
+  # A broker that misbehaves on purpose: 5% timeouts, 2% rejects, late and split fills, 10% duplicate callbacks.
+  # Counters at :9300/stats.
+  broker:
+    profiles: [app]
+    image: risk-engine-app
+    command: ["/opt/broker-mock/bin/broker-mock", "--port", "9300", "--callback-url", "http://relay:9200/broker/callbacks",
+              "--chaos", "${BROKER_CHAOS:-full}"]
+    ports: ["${BROKER_PORT:-9300}:9300"]
+
   api:
     profiles: [app]
     image: risk-engine-app
     command: ["java", "-jar", "/opt/api/api.jar"]
     environment:
-      # A fixed key is fine on a laptop and nowhere else: anyone who knows it can mint tokens.
-      # Set JWT_SECRET to something private for anything shared.
+      # DEV ONLY. A fixed, published key: anyone who has this file can mint tokens for any account.
+      # Fine on a laptop, never anywhere shared: set JWT_SECRET to something private there.
       JWT_SECRET: ${JWT_SECRET:-local-dev-only-jwt-secret-do-not-deploy-0123456789}
       KAFKA_BOOTSTRAP: redpanda:9092
       ENGINE_PARTITIONS: ${ENGINE_PARTITIONS:-4}

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# M4 end to end, through docker compose:
+# End to end, through docker compose (M4, extended in M5):
 #
 #   replayer ticks -> Redpanda -> shards -> margin events in Postgres
 #   POST /orders   -> Redpanda -> shard's pre-trade check -> writers -> order ACCEPTED in Postgres and in GET /orders/{id}
+#   M5: accepted orders and square-off legs -> outbox -> relay -> mock broker (full chaos) -> fills -> ledger;
+#       the synthetic fall squares accounts off; risk-ops blocks and unblocks an account over HTTP
 #
 # It runs as its own compose project ("risk-e2e") on its own ports and volumes, so it never touches the
 # default stack or its data, and removes everything it created when it finishes.
@@ -12,17 +14,27 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export COMPOSE_PROJECT_NAME=risk-e2e
-export POSTGRES_PORT=55432 REDPANDA_PORT=39092 REDPANDA_ADMIN_PORT=39644 REDIS_PORT=56379 API_PORT=58080 METRICS_PORT=59100
+export POSTGRES_PORT=55432 REDPANDA_PORT=39092 REDPANDA_ADMIN_PORT=39644 REDIS_PORT=56379 API_PORT=58080 METRICS_PORT=59100 BROKER_PORT=59300
+export BROKER_CHAOS=full
 export JWT_SECRET="e2e-only-secret-0123456789-abcdefghijklmnop"
 export DATA_DIR="$PWD/build/e2e-data"
 API="http://localhost:$API_PORT"
 R=replayer/build/install/replayer/bin/replayer
 BODY=$(mktemp)
+LOG=$(mktemp)
 
 psql() { docker compose exec -T postgres psql -U risk -d risk -v ON_ERROR_STOP=1 -tA "$@"; }
 pass() { echo "  ok  $*"; }
-fail() { echo "FAIL  $*" >&2; docker compose --profile app logs --no-color --tail 40 shard-host writers api book-loader >&2 || true; exit 1; }
-cleanup() { rm -f "$BODY"; docker compose --profile app down -v --remove-orphans >/dev/null 2>&1 || true; }
+# On failure, show everything needed to see why without re-running: what compose said, the state of every
+# container, and the tail of every service's log.
+fail() {
+  echo "FAIL  $*" >&2
+  { echo "---- docker compose output"; cat "$LOG"
+    echo "---- containers"; docker compose --profile app ps -a
+    echo "---- service logs"; docker compose --profile app logs --no-color --tail 60; } >&2 2>&1 || true
+  exit 1
+}
+cleanup() { rm -f "$BODY" "$LOG"; docker compose --profile app down -v --remove-orphans >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 wait_for() { # wait_for "what" command...
   local what="$1"; shift
@@ -41,9 +53,9 @@ accounts=$(($(wc -l < "$DATA_DIR/seed/accounts.csv") - 1))
 pass "$accounts accounts seeded from synthetic instruments"
 
 echo "== docker compose --profile app up (project $COMPOSE_PROJECT_NAME)"
-cleanup
-docker compose --profile app build -q
-docker compose --profile app up -d >/dev/null 2>&1 || fail "compose up"
+docker compose --profile app down -v --remove-orphans >/dev/null 2>&1 || true
+docker compose --profile app build >"$LOG" 2>&1 || fail "docker compose build"
+docker compose --profile app up -d >"$LOG" 2>&1 || fail "docker compose up"
 wait_for "the API" sh -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' $API/orders/x)\" = 401 ]"
 wait_for "the shard host" curl -sf "http://localhost:$METRICS_PORT/healthz"
 [ "$(psql -c 'select count(*) from accounts')" = "$accounts" ] || fail "book not loaded into Postgres"
@@ -77,13 +89,54 @@ code=$(post e2e-request-0001)
 [ "$code" = 202 ] || fail "POST /orders answered $code: $(cat "$BODY")"
 order=$(sed -E 's/.*"orderId":"([^"]+)".*/\1/' "$BODY")
 pass "202 Accepted for $account, order $order"
-accepted() { [ "$(psql -c "select status from orders where id = '$order'")" = ACCEPTED ]; }
-wait_for "the order to be ACCEPTED in Postgres" accepted
-pass "orders row in Postgres: $(psql -c "select id || ' ' || account_id || ' ' || instrument_id || ' ' || side || ' ' || qty || ' ' || status from orders where id = '$order'")"
+# Once accepted the order goes on to the broker, so by the time we look it may be SENT or FILLED already.
+decided() { psql -c "select status from orders where id = '$order'" | grep -Eq '^(ACCEPTED|SENT|PARTIALLY_FILLED|FILLED|BROKER_REJECTED)$'; }
+wait_for "the shard to accept the order" decided
 [ "$(psql -c "select count(*) from audit_log where request_id = '$order' and action = 'ORDER_ACCEPTED'")" = 1 ] || fail "no audit row for the decision"
-pass "audit_log: $(psql -c "select actor || ' ' || action || ' ' || details::text from audit_log where request_id = '$order'")"
-curl -s "$API/orders/$order" -H "Authorization: Bearer $token" | grep -q '"status":"ACCEPTED"' || fail "GET /orders/$order does not show ACCEPTED"
-pass "GET /orders/$order shows ACCEPTED"
+pass "accepted by the shard: $(psql -c "select actor || ' ' || action || ' ' || details::text from audit_log where request_id = '$order'")"
+done_at_broker() { psql -c "select status from orders where id = '$order'" | grep -Eq '^(FILLED|BROKER_REJECTED)$'; }
+wait_for "the broker to fill (or reject) the order" done_at_broker
+final=$(psql -c "select status from orders where id = '$order'")
+if [ "$final" = FILLED ]; then
+  [ "$(psql -c "select coalesce(sum(qty), 0) from fills where order_id = '$order'")" = 25 ] || fail "fills for $order do not add up to 25"
+  [ "$(psql -c "select count(*) from ledger_entries where ref_id in (select broker_fill_id from fills where order_id = '$order')")" -ge 2 ] || fail "no ledger entries for the premium paid"
+fi
+pass "orders row: $(psql -c "select id || ' ' || account_id || ' ' || instrument_id || ' ' || side || ' ' || qty || ' ' || status || ' required_after ' || required_after from orders where id = '$order'"); $(psql -c "select count(*) from fills where order_id = '$order'") fill(s)"
+view=$(curl -s "$API/orders/$order" -H "Authorization: Bearer $token")
+echo "$view" | grep -q "\"status\":\"$final\"" && echo "$view" | grep -q '"requiredAfter"' || fail "GET /orders/$order: $view"
+pass "GET /orders/$order: $view"
+
+echo "== square-off under full broker chaos"
+drained() {
+  [ "$(psql -c "select count(*) from square_off_episodes where status = 'OPEN'")" = 0 ] &&
+  [ "$(psql -c "select count(*) from outbox where sent_at is null")" = 0 ] &&
+  [ "$(psql -c "select count(*) from square_off_legs where status in ('PLANNED', 'SENT')")" = 0 ]
+}
+wait_for "every square-off episode to finish" drained
+sleep 3; drained || fail "square-off had not really finished"
+episodes=$(psql -c "select count(*) from square_off_episodes")
+[ "$episodes" -gt 0 ] || fail "the synthetic fall squared nobody off"
+pass "$episodes episodes: $(psql -c "select string_agg(status || ' ' || n, ', ') from (select status, count(*) n from square_off_episodes group by status) t"); $(psql -c "select string_agg(status || ' ' || n, ', ') from (select status, count(*) n from square_off_legs group by status) t") legs"
+overfilled=$(psql -c "select count(*) from square_off_legs l left join (select order_id, sum(qty) q from fills group by order_id) f on f.order_id = l.leg_key where coalesce(f.q, 0) <> case l.status when 'FILLED' then l.qty else 0 end")
+[ "$overfilled" = 0 ] || fail "$overfilled legs whose fills do not add up to the leg"
+pass "every leg filled exactly once or rejected: 0 legs closed twice"
+unbalanced=$(psql -c "select count(*) from (select txn_id from ledger_entries group by txn_id having sum(amount) <> 0) t")
+[ "$unbalanced" = 0 ] || fail "$unbalanced unbalanced ledger transactions"
+pass "$(psql -c "select count(distinct txn_id) from ledger_entries") ledger transactions, all summing to zero; $(psql -c "select count(*) from fills") fills"
+pass "broker: $(curl -s "http://localhost:$BROKER_PORT/stats")"
+
+echo "== risk-ops over real HTTP"
+ops=$(./gradlew -q :api:devToken --args="risk-ops e2e-ops" | tail -1)
+control() { curl -s -o /dev/null -w '%{http_code}' -X POST "$API/accounts/$account/$1" -H "Authorization: Bearer $ops" -H "X-Request-Id: $2"; }
+[ "$(control block e2e-control-0001)" = 202 ] || fail "block was not accepted"
+blocked() { [ "$(psql -c "select status from accounts where id = '$account'")" = BLOCKED ]; }
+wait_for "the account to be BLOCKED" blocked
+[ "$(control block e2e-control-0001)" = 409 ] || fail "a replayed block was not rejected"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/accounts/$account/block" -H "Authorization: Bearer $token" -H 'X-Request-Id: e2e-control-0002')" = 403 ] || fail "a trader could block"
+[ "$(control unblock e2e-control-0003)" = 202 ] || fail "unblock was not accepted"
+unblocked() { [ "$(psql -c "select status from accounts where id = '$account'")" = ACTIVE ]; }
+wait_for "the account to be ACTIVE again" unblocked
+pass "block -> BLOCKED, same request again -> 409, a trader -> 403, unblock -> ACTIVE ($(psql -c "select count(*) from audit_log where account_id = '$account' and actor = 'risk-ops:e2e-ops'") audit rows by risk-ops:e2e-ops)"
 
 echo "== the security checks, over real HTTP"
 [ "$(post e2e-request-0001)" = 409 ] || fail "replayed request id was not rejected"
@@ -100,4 +153,4 @@ done
 [ "$limited" -gt 0 ] || fail "40 rapid requests were never rate limited"
 pass "40 rapid requests -> $limited answered 429"
 
-echo "M4 end-to-end passed."
+echo "End-to-end passed."

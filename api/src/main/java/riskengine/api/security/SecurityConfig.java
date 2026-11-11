@@ -59,6 +59,8 @@ class SecurityConfig {
                 .authorizeHttpRequests(a -> a
                         .requestMatchers(HttpMethod.POST, "/orders").hasRole(Caller.Role.TRADER.name())
                         .requestMatchers(HttpMethod.GET, "/orders/*").hasAnyRole(Caller.Role.TRADER.name(), Caller.Role.RISK_OPS.name())
+                        .requestMatchers(HttpMethod.GET, "/accounts/*").hasAnyRole(Caller.Role.TRADER.name(), Caller.Role.RISK_OPS.name())
+                        .requestMatchers(HttpMethod.POST, "/accounts/*/block", "/accounts/*/unblock", "/accounts/*/square-off").hasRole(Caller.Role.RISK_OPS.name())
                         .anyRequest().denyAll())
                 .oauth2ResourceServer(o -> o
                         .jwt(jwt -> jwt.jwtAuthenticationConverter(authorities()))

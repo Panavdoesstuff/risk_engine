@@ -17,7 +17,9 @@ class StressRunTest {
         StressReport r = StressRun.run(SMALL);
         System.out.println(r.summary());
         assertEquals(0, r.mismatches(), r.summary());
-        assertEquals(80_000, r.records());
+        assertTrue(r.records() >= 80_000, "80,000 written by the writers, plus the leg fills: " + r.records());
+        assertTrue(r.episodes() > 20 && r.legs() > r.episodes(), "square-off under the same race: " + r.episodes() + " episodes, " + r.legs() + " legs");
+        assertTrue(r.decisions().containsKey("SQUARING_OFF") && r.decisions().containsKey("ACCOUNT_BLOCKED"), r.decisions().toString());
         // The comparison only means something if the run exercised everything.
         assertTrue(r.decisions().getOrDefault("OK", 0L) > 1_000, r.decisions().toString());
         assertTrue(r.decisions().getOrDefault("INSUFFICIENT_MARGIN", 0L) > 100, r.decisions().toString());
@@ -26,7 +28,7 @@ class StressRunTest {
         assertTrue(r.levelChanges() > 100, "level changes: " + r.levelChanges());
         assertTrue(r.releases() > 100, "reservations released by a close: " + r.releases());
         assertTrue(r.duplicateFills() > 100 && r.duplicateOrders() > 100, r.duplicateFills() + " / " + r.duplicateOrders());
-        assertTrue(r.byType().keySet().containsAll(List.of("Tick", "OrderRequest", "Fill", "OrderClosed", "SquareOffResult")), r.byType().toString());
+        assertTrue(r.byType().keySet().containsAll(List.of("Tick", "OrderRequest", "Fill", "OrderClosed", "AccountControl", "SquareOffResult")), r.byType().toString());
     }
 
     @Test

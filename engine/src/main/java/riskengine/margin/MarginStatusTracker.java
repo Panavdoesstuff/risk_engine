@@ -10,8 +10,8 @@ package riskengine.margin;
  *   <li>Going down is immediate: the moment utilisation is back below a threshold, its streak resets.</li>
  * </ul>
  *
- * M5 replaces raw utilisation with expected utilisation (net of in-flight square-off legs) and makes
- * square-off sticky until the episode ends; this class stays the threshold logic.
+ * What is fed in is expected utilisation (net of the square-off leg in flight), and while an episode is
+ * open nothing is fed in at all: see {@link AccountRisk}. This class is only the threshold logic.
  */
 public final class MarginStatusTracker {
     private final Thresholds t;
@@ -34,6 +34,24 @@ public final class MarginStatusTracker {
 
     public int squareOffStreak() {
         return squareOffStreak;
+    }
+
+    /**
+     * A reading that may only lower the level (a fill, or the end of a square-off episode). Going down is
+     * immediate, as on a tick; going up needs consecutive ticks, so this never raises anything and never
+     * adds to a streak.
+     *
+     * @return the level after this reading
+     */
+    public MarginLevel lower(double utilisation) {
+        if (utilisation < t.squareOff()) squareOffStreak = 0;
+        if (utilisation < t.marginCall()) callStreak = 0;
+        MarginLevel reading = squareOffStreak >= t.confirmTicks() ? MarginLevel.SQUARE_OFF
+                : callStreak >= t.confirmTicks() ? MarginLevel.MARGIN_CALL
+                : utilisation >= t.warning() ? MarginLevel.WARNING
+                : MarginLevel.OK;
+        if (reading.compareTo(level) < 0) level = reading;
+        return level;
     }
 
     /** @return the level after this reading */

@@ -289,20 +289,20 @@ class PreTradeCheckTest {
         }
         lines.add(EngineOutputCodec.encode(b.order("O-1", "RICH", CALL, Side.SELL, 25)));
         lines.add(EngineOutputCodec.encode(b.apply(new Fill("F1", "O-1", "RICH", CALL.id(), -25, new BigDecimal("250.50"), 9)).get(0)));
-        assertEquals("POSITION|v1|RICH|NIFTY-20240613-23300-CE|-25|250.500000|5006262.50|F1|9", lines.get(lines.size() - 1));
+        assertEquals("POSITION|v1|RICH|NIFTY-20240613-23300-CE|-25|250.500000|5006262.50|F1|O-1|-25|250.50|6262.50|0|9", lines.get(lines.size() - 1));
         lines.add(EngineOutputCodec.encode(b.apply(new OrderClosed("O-1", "RICH", OrderClosed.Reason.UNFILLED, 10)).get(0)));
         assertEquals("RELEASED|v1|O-1|RICH|UNFILLED|0|10", lines.get(lines.size() - 1), "fully filled, so nothing was left to release");
         lines.add(EngineOutputCodec.encode(b.order("O-0", "RICH", CALL, Side.SELL, 25)));
         lines.add(EngineOutputCodec.encode(b.order("O-2", "NOBODY", CALL, Side.SELL, 25)));
         assertTrue(lines.stream().anyMatch(l -> l.startsWith("MARGIN|v1|THIN|")), lines.toString());
         assertTrue(lines.get(lines.size() - 5).startsWith("DECISION|v1|O-1|RICH|NIFTY-20240613-23300-CE|SELL|25|ACCEPTED|OK|4|"), lines.toString());
-        assertEquals("DECISION|v1|O-2|NOBODY|NIFTY-20240613-23300-CE|SELL|25|REJECTED|UNKNOWN_ACCOUNT|4|" + Fixtures.T0 + "|0.0000|0.0000|0.000000",
+        assertEquals("DECISION|v1|O-2|NOBODY|NIFTY-20240613-23300-CE|SELL|25|REJECTED|UNKNOWN_ACCOUNT|4|" + Fixtures.T0 + "|0.0000|0.0000|0.000000|0",
                 lines.get(lines.size() - 1));
         for (String line : lines) {
             EngineOutput decoded = EngineOutputCodec.decode(line);
             assertEquals(line, EngineOutputCodec.encode(decoded), "decode then encode gives the same line");
         }
-        assertThrows(IllegalArgumentException.class, () -> EngineOutputCodec.decode("DECISION|v1|O|A|I|BUY|25|MAYBE|OK|1|1|0|0|0"));
+        assertThrows(IllegalArgumentException.class, () -> EngineOutputCodec.decode("DECISION|v1|O|A|I|BUY|25|MAYBE|OK|1|1|0|0|0|0"));
         assertThrows(IllegalArgumentException.class, () -> EngineOutputCodec.decode("MARGIN|v2|x"));
     }
 }
